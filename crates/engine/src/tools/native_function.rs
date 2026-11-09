@@ -7,7 +7,7 @@ use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_p
 use craft_anything_analysis::native as an;
 use craft_anything_disasm::pseudo::lift;
 use craft_anything_disasm::{Flow, XrefKind};
-use craft_anything_evidence::{Confidence, Coverage, Limitation, Location, ToolError};
+use craft_anything_evidence::{Confidence, Coverage, Evidence, Limitation, Location, ToolError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -78,10 +78,10 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             PSEUDOCODE_TOOL,
             "Decompile",
-            "Structured pseudo-C from the built-in clean-room lifter: register-level variables, if/else and loops from the control-flow graph, resolved call names, inline string literals. Honest about its limits.",
+            "Pseudo-C from the Deep engine when available, otherwise the built-in lifter: register-level variables, if/else and loops, resolved call names and inline strings. Records the engine and any fallback limitations.",
             "Read a function as C-like code.",
             Native,
-            e | Effects::CARRIES_TARGET_CONTENT,
+            e | Effects::CARRIES_TARGET_CONTENT | Effects::LAUNCHES_PROCESS,
             t,
             schema_of::<ProcParams>,
             native_function_pseudocode,
@@ -376,6 +376,13 @@ fn native_function_references_list(ctx: &mut Ctx<'_>, params: Value) -> Result<T
 
 fn native_function_pseudocode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: ProcParams = parse_params(params)?;
+    decompile(ctx, &p).map(ToolOutput::evidence)
+}
+
+/// The same address resolution, Deep engine and fallback for one function or a batch. This
+/// returns evidence directly: callers do not dispatch another tool while holding the session.
+pub(super) fn decompile(ctx: &mut Ctx<'_>, p: &ProcParams) -> Result<Evidence, ToolError> {
+    ctx.cancel.check()?;
     select_document(ctx, &p.document)?;
     // Resolve the function entry in a scoped borrow so the deep hook can take `&mut ctx`. The
     // built-in analysis stops short on a huge program (a 200 MB game has far more functions than
@@ -398,7 +405,11 @@ fn native_function_pseudocode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOu
     };
     // Deep mode (Ghidra) is preferred through this same tool id when it is on and available;
     // otherwise, and whenever anything about it fails, we use the built-in clean-room lifter.
-    let why_not_deep = match super::deep::pseudo_code(ctx, at, our_base, params_json(&p)) {
+    let deep = super::deep::pseudo_code(ctx, at, our_base, params_json(p));
+    // Startup and decompilation can take time. A stop during either must not turn into a
+    // successful built-in fallback, even when the bridge only returned an unavailable reason.
+    ctx.cancel.check()?;
+    let why_not_deep = match deep {
         Ok(result) => return result,
         Err(why) => why,
     };
@@ -418,7 +429,8 @@ fn native_function_pseudocode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOu
     let names = |a: u64| user.get(&a).cloned();
     let name = name_of(t, &st.prog, f.entry).unwrap_or_else(|| f.name.clone());
     let ps = lift(&st.img, &st.prog, f, &names);
-    let e = ev(ctx, "native_function_pseudocode", params_json(&p))?
+    ctx.cancel.check()?;
+    ev(ctx, "native_function_pseudocode", params_json(p))?
         .result(json!({"function": name_of(t, &st.prog, f.entry), "entry": hex(f.entry), "signature": ps.signature, "pseudo_code": ps.text, "calls": ps.calls, "strings": ps.strings, "structured": ps.structured, "gotos": ps.gotos, "inline_asm": ps.asm_fallbacks, "engine": "clean-room lifter"}))
         .summary(format!("Pseudo-C for {name} ({} lines{}).", ps.text.lines().count(), if ps.structured { "" } else { ", partly unstructured" }))
         .confidence(Confidence::Inferred)
@@ -426,8 +438,7 @@ fn native_function_pseudocode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOu
         .limitations(ps.limitations.iter().map(|(c, m)| Limitation::new(c.clone(), m.clone())))
         .limitations(why_not_deep.map(|w| Limitation::new("deep_engine_unavailable", format!("{w} So this came from the built-in decompiler, which is less exact."))))
         .location(Location::address(f.entry))
-        .build()?;
-    Ok(ToolOutput::evidence(e))
+        .build()
 }
 
 /// An address Ghidra can look up: `0x…`, a bare hex address, or a generated name like `FUN_…`.

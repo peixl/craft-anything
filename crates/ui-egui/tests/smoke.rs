@@ -214,6 +214,8 @@ fn deep_mode_without_ghidra_asks_to_get_it_before_using_it() {
     // Tall enough to show Start below the Clean room / Deep, engine and asset choices.
     let mut h = harness_sized(egui::vec2(1280.0, 1120.0), move || {
         let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.settings.deep_mode = false;
+        a.engine.session().settings.deep_mode = false;
         demo::fill_projects(&mut a);
         // An empty engine store: no Ghidra here.
         a.settings.engines.store_dir = Some(store);
@@ -912,6 +914,8 @@ fn mode_switch_and_deep_toggle() {
     let empty = store.path().to_path_buf();
     let mut h = harness(move || {
         let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.settings.deep_mode = false;
+        a.engine.session().settings.deep_mode = false;
         a.settings.engines.store_dir = Some(empty);
         a
     });
@@ -1097,7 +1101,12 @@ fn opening_a_missing_file_is_a_calm_error() {
 #[test]
 fn clean_room_asks_for_deep_mode_instead_of_opening_a_file() {
     use craft_anything_ui_egui::state::Modal;
-    let mut h = harness(|| demo::app(demo::engine(Mode::Beginner, true)));
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.settings.deep_mode = false;
+        a.engine.session().settings.deep_mode = false;
+        a
+    });
     h.run_steps(2);
     h.state_mut().open_path(std::path::PathBuf::from("/samples/tool.exe"));
     assert!(wait(&mut h, |a| a.state.modal == Some(Modal::DeepMode)), "Clean room never opens the original");
@@ -2129,15 +2138,9 @@ fn the_front_door_makes_something_or_just_looks_inside() {
     h.run_steps(3);
     assert!(h.state().state.make.look);
     h.get_by_label("What do you want to look inside?");
-    // Each way in reads the original, so Clean room asks for Deep mode first.
-    assert!(h.query_by_label("An app or a file").is_none());
-    h.get_by_label("Looking inside needs Deep mode");
-    h.get_by_label("Turn on Deep mode").click();
-    h.run_steps(3);
+    // A fresh installation can look inside immediately; explicit Clean room is tested separately.
     assert!(h.state().settings.deep_mode);
-    // Without Ghidra here, Deep mode offers it; not now.
-    h.state_mut().state.modal = None;
-    h.run_steps(2);
+    assert!(h.query_by_label("Looking inside needs Deep mode").is_none());
     h.get_by_label("An app or a file");
     h.get_by_label("A website").click();
     h.run_steps(3);

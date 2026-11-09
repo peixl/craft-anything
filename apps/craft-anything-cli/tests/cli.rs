@@ -59,11 +59,35 @@ fn capabilities_keep_the_clean_room_refusal() {
         let tools = v["toolsets"].as_array().unwrap().iter().flat_map(|t| t["tools"].as_array().unwrap().clone());
         tools.into_iter().find(|t| t["tool"] == id).unwrap_or_else(|| panic!("{id} not in {v}"))
     };
-    let clean = tool(&["--format", "json", "capabilities"], "native_function_pseudocode");
+    let clean = tool(&["--clean-room", "--format", "json", "capabilities"], "native_function_pseudocode");
     assert_eq!((clean["available"].as_bool(), clean["needs_target"].as_bool()), (Some(false), Some(true)), "{clean}");
     assert!(clean["reason"].as_str().is_some_and(|r| !r.is_empty()), "{clean}");
-    let deep = tool(&["--deep", "--format", "json", "capabilities"], "native_function_pseudocode");
+    let deep = tool(&["--format", "json", "capabilities"], "native_function_pseudocode");
     assert_eq!((deep["available"].as_bool(), deep["reason"].is_null()), (Some(true), true), "{deep}");
+}
+
+#[test]
+fn fresh_cli_defaults_to_deep_but_saved_modes_and_one_run_overrides_win() {
+    let cfg = tempfile::tempdir().unwrap();
+    let mode = |flags: &[&str]| {
+        let mut args = flags.to_vec();
+        args.extend(["--format", "json", "capabilities"]);
+        let out = cli(&args, cfg.path());
+        assert!(out.success, "{}", out.stderr_text());
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["analysis_mode"].clone()
+    };
+    assert_eq!(mode(&[]), "deep");
+    assert_eq!(mode(&["--clean-room"]), "clean-room");
+    assert!(!cfg.path().join("config.toml").exists());
+    for text in ["version = 3\n", "version = 3\ndeep_mode = false\n", "version = 4\ndeep_mode = false\n"] {
+        std::fs::write(cfg.path().join("config.toml"), text).unwrap();
+        assert_eq!(mode(&[]), "clean-room");
+        assert_eq!(mode(&["--deep"]), "deep");
+        assert_eq!(std::fs::read_to_string(cfg.path().join("config.toml")).unwrap(), text);
+    }
+    std::fs::write(cfg.path().join("config.toml"), "version = 3\ndeep_mode = true\n").unwrap();
+    assert_eq!(mode(&[]), "deep");
+    assert_eq!(mode(&["--clean-room"]), "clean-room");
 }
 
 /// After the tool name, `--project` is the tool's own option when it has one (it used to be taken
@@ -126,7 +150,7 @@ fn clean_room_refuses_to_look_inside_and_says_how_to_turn_on_deep_mode() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("sample.bin");
     std::fs::write(&file, b"\x7fELF not really").unwrap();
-    let out = cli(&["core-target-open", file.to_str().unwrap()], cfg.path());
+    let out = cli(&["--clean-room", "core-target-open", file.to_str().unwrap()], cfg.path());
     assert_eq!(out.code, Some(1), "{}", out.stdout_text());
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["error"]["details"]["reason"], "clean_room", "{v}");

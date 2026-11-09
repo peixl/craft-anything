@@ -1098,8 +1098,14 @@ fn games_get_the_mechanics_sheet_and_decompile_only_in_deep_mode() {
     for b in [&deep, &clean] {
         assert!(b.contains("MECHANICS.md"), "{b}");
     }
-    // Deep mode: 1:1 with the original's own files, for private use, never decrypting anything.
-    assert!(deep.contains("original game's own files") && deep.contains("Never decrypt") && deep.contains("must not be shared") && deep.contains("CREDITS.md"));
+    // Deep mode uses the actual archive capabilities, reporting missing keys or engines.
+    assert!(
+        deep.contains("original game's own files")
+            && deep.contains("Encryption needs the correct key")
+            && deep.contains("must not be shared")
+            && deep.contains("CREDITS.md")
+    );
+    assert!(deep.contains("missing key or format support") && deep.contains("preserve the originals") && !deep.contains("Never decrypt"));
     assert!(deep.contains(PRIVATE_USE_NOTE), "the README line the credits check looks for, as written");
     // It points the builder at the app's own archive tools before any outside converter.
     assert!(deep.contains("enable_toolset with \"formats\"") && deep.contains("game_pak_extract") && deep.contains("game_unreal_texture_export"));
@@ -2923,8 +2929,15 @@ fn a_stopped_build_is_told_to_carry_on_not_start_over() {
 fn the_extractor_takes_the_originals_out_and_the_builder_is_told_where() {
     let b = extract_brief(Path::new("D:/Games/Cave Game"));
     assert!(b.contains("D:/Games/Cave Game") && b.contains("app/Original/") && b.contains("permission: true"), "{b}");
-    assert!(b.contains("Never decrypt") && b.contains("You don't build the game") && b.contains(&format!("app/{ORIGINALS_MANIFEST}")), "{b}");
-    assert!(b.contains("never write your own archive reader") && b.contains("ending in `/`"), "{b}");
+    assert!(
+        b.contains("Encryption needs the correct key") && b.contains("You don't build the game") && b.contains(&format!("app/{ORIGINALS_MANIFEST}")),
+        "{b}"
+    );
+    assert!(
+        b.contains("format-specific helper inside app/Original/tools/") && b.contains("preserve the original archives") && b.contains("ending in `/`"),
+        "{b}"
+    );
+    assert!(!b.contains("Never decrypt") && !b.contains("never write your own archive reader"), "{b}");
     assert!(ORIGINALS_READY.contains("app/Original/MANIFEST.md") && ORIGINALS_READY.contains("CREDITS.md"));
 }
 

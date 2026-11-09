@@ -11,9 +11,9 @@
 //! retry it on every call.
 
 use crate::settings::Settings;
-use crate::tool::{Ctx, ToolOutput};
+use crate::tool::Ctx;
 use craft_anything_engines::ghidra::{self, DeepDecompiler, DeepFunction};
-use craft_anything_evidence::{Confidence, Environment, EvidenceBuilder, Limitation, Location, ToolError, host_triple};
+use craft_anything_evidence::{Confidence, Environment, Evidence, EvidenceBuilder, Limitation, Location, ToolError, host_triple};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -157,7 +157,7 @@ pub enum At {
 /// position-independent ELF goes to 0x100000), so addresses are moved between the two.
 /// `Err(why)` → the caller uses the built-in lifter and passes on why Ghidra wasn't used (`None`
 /// in Clean room). `Ok(Err(..))` only for a cancellation the caller should surface.
-pub fn pseudo_code(ctx: &mut Ctx<'_>, at: At, our_base: u64, params: serde_json::Value) -> Result<Result<ToolOutput, ToolError>, Option<String>> {
+pub fn pseudo_code(ctx: &mut Ctx<'_>, at: At, our_base: u64, params: serde_json::Value) -> Result<Result<Evidence, ToolError>, Option<String>> {
     let provider = provider_for_active(ctx)?;
     let rebase = ghidra::Rebase::new(our_base, provider.image_base());
     let entry = match at {
@@ -165,6 +165,9 @@ pub fn pseudo_code(ctx: &mut Ctx<'_>, at: At, our_base: u64, params: serde_json:
         At::Engine(a) => a,
     };
     match provider.decompile(entry) {
+        Ok(Some(df)) if df.pseudocode.as_deref().is_none_or(|code| code.trim().is_empty()) => {
+            Err(Some("Ghidra found this function but returned no pseudo-C.".into()))
+        }
         Ok(Some(df)) => {
             let renames = user_renames(ctx, rebase);
             Ok(build_evidence(ctx, provider.as_ref(), df, rebase, &renames, params))
@@ -346,7 +349,7 @@ fn build_evidence(
     rebase: ghidra::Rebase,
     renames: &Renames,
     params: serde_json::Value,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<Evidence, ToolError> {
     let subject = ctx.session.active()?.target.subject();
     let env = Environment {
         clean_room: false,
@@ -424,7 +427,7 @@ fn build_evidence(
             "Ghidra's analysis had no function here, so it made one starting at this address (for this session, never saved); its bounds come from following the code from there",
         ));
     }
-    Ok(ToolOutput::evidence(e.build()?))
+    e.build()
 }
 
 #[cfg(test)]
@@ -526,6 +529,123 @@ mod tests {
         let mut s = e.session();
         s.settings.deep_mode = true;
         s.active_mut().unwrap().ext.insert(Arc::new(DeepSlot { provider: Ok(provider) }));
+    }
+
+    #[test]
+    fn a_batch_uses_deep_addresses_and_names_without_losing_other_items() {
+        let (elf, layout) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &elf);
+        const SHIFT: u64 = 0x10_0000;
+        with_deep(&e, Arc::new(Moved { base: tk::ELF_BASE + SHIFT, asked: AtomicU64::new(0) }));
+        call(&e, "native_name_set", json!({"address": format!("{:#x}", layout.code_va), "name": "start_here"}));
+        let outside = layout.code_va + 0x7a00;
+        let generated = format!("FUN_{:08x}", outside + SHIFT);
+        let batch = call(&e, "native_functions_decompile", json!({"addresses": ["main", "missing_function", generated]}));
+        assert_eq!(batch["result"]["succeeded"], 2);
+        assert_eq!(batch["result"]["failed"], 1);
+        assert_eq!(batch["carries_target_content"], true);
+        let items = batch["result"]["items"].as_array().unwrap();
+        assert_eq!(items[0]["pseudo_code"], "int start_here(void) { return 0; }");
+        assert_eq!(items[0]["entry"], format!("{:#x}", layout.code_va));
+        assert_eq!(items[0]["engine_entry"], format!("{:#x}", layout.code_va + SHIFT));
+        assert_eq!(items[1]["ok"], false);
+        assert_eq!(items[2]["entry"], format!("{outside:#x}"));
+        for item in [&items[0], &items[2]] {
+            assert_eq!(item["ok"], true);
+            assert_eq!(item["engine"], "ghidra");
+            assert_eq!(item["environment"]["engine"], "ghidra");
+            assert_eq!(item["confidence"], "derived");
+            assert_eq!(item["carries_target_content"], true);
+            assert!(item["structured"].is_null(), "Deep does not report the builtin structure metric");
+            assert!(item["limitations"].as_array().unwrap().iter().any(|code| code == "engine_rebased"));
+        }
+        let single = call(&e, "native_function_pseudocode", json!({"function": "main"}));
+        assert_eq!(items[0]["pseudo_code"], single["result"]["pseudo_code"]);
+        assert_eq!(items[0]["limitation_details"], single["limitations"]);
+    }
+
+    struct Incomplete {
+        code: Option<String>,
+    }
+
+    impl DeepDecompiler for Incomplete {
+        fn engine(&self) -> &'static str {
+            "ghidra"
+        }
+        fn engine_version(&self) -> Option<String> {
+            None
+        }
+        fn decompile(&self, entry: u64) -> Result<Option<DeepFunction>, ghidra::GhidraError> {
+            Ok(Some(DeepFunction { entry, name: "incomplete".into(), signature: None, pseudocode: self.code.clone(), created: false }))
+        }
+        fn list_functions(&self) -> Result<Vec<DeepFunction>, ghidra::GhidraError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_deep_function_without_code_falls_back_or_reports_the_missing_answer() {
+        for code in [None, Some(" \n\t".into())] {
+            let (elf, layout) = tk::elf64(tk::ElfArch::X86_64, true);
+            let e = engine_with("prog", &elf);
+            with_deep(&e, Arc::new(Incomplete { code }));
+            let unknown = format!("{:#x}", layout.code_va + 0x7a00);
+            let batch = call(&e, "native_functions_decompile", json!({"addresses": ["main", unknown]}));
+            assert_eq!(batch["result"]["succeeded"], 1);
+            assert_eq!(batch["result"]["failed"], 1);
+            let items = batch["result"]["items"].as_array().unwrap();
+            assert_eq!(items[0]["engine"], "clean-room lifter");
+            assert!(items[0]["pseudo_code"].as_str().unwrap().contains("puts"));
+            assert!(items[0]["limitation_details"].as_array().unwrap().iter().any(|l| l["message"].as_str().is_some_and(|m| m.contains("no pseudo-C"))));
+            assert_eq!(items[1]["ok"], false);
+            assert!(items[1]["remediation"].as_str().unwrap().contains("no pseudo-C"));
+            let single = call(&e, "native_function_pseudocode", json!({"function": "main"}));
+            assert_eq!(items[0]["pseudo_code"], single["result"]["pseudo_code"]);
+        }
+    }
+
+    struct Stops {
+        cancel: crate::CancelToken,
+        explicit_error: bool,
+        calls: AtomicUsize,
+    }
+
+    impl DeepDecompiler for Stops {
+        fn engine(&self) -> &'static str {
+            "ghidra"
+        }
+        fn engine_version(&self) -> Option<String> {
+            None
+        }
+        fn decompile(&self, _: u64) -> Result<Option<DeepFunction>, ghidra::GhidraError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.explicit_error {
+                Err(ghidra::GhidraError::Cancelled)
+            } else {
+                self.cancel.cancel();
+                Ok(None)
+            }
+        }
+        fn list_functions(&self) -> Result<Vec<DeepFunction>, ghidra::GhidraError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_cancelled_deep_call_neither_falls_back_nor_starts_the_next_batch_item() {
+        for explicit_error in [false, true] {
+            let (elf, _) = tk::elf64(tk::ElfArch::X86_64, true);
+            let e = engine_with("prog", &elf);
+            let cancel = crate::CancelToken::default();
+            let provider = Arc::new(Stops { cancel: cancel.clone(), explicit_error, calls: AtomicUsize::new(0) });
+            with_deep(&e, provider.clone());
+            let err = e
+                .call("native_functions_decompile", json!({"addresses": ["main", "helper"]}), crate::CallOptions::new(crate::Caller::Cli).with_cancel(cancel))
+                .unwrap_err();
+            assert_eq!(err.code, craft_anything_evidence::ErrorCode::Cancelled);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert!(!e.session().ledger().any(|ev| ev.operation == "native_functions_decompile"));
+        }
     }
 
     #[test]

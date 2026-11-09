@@ -562,7 +562,7 @@ Golden rule 3: the result is evidence. Each fix needs a Mac to test on.
 Owner: open · Status: todo
 The code for each of these is done; what's left is to run it for real and record the result in
 STATUS.md. A failure becomes a new line under its item. Grouped by what the run needs. Start with
-the Clean room build and the README quick start: Clean room is the default and has no live build
+the Clean room build and the README quick start: Clean room remains an explicit option and has no live build
 yet, and the quick start is how every new person begins.
 
 **A signed-in coding agent:**
@@ -1019,10 +1019,12 @@ Owner: maintainers · Status: in progress
 ### R2.9 Everyday use: typing, projects, settings
 Owner: maintainers · Status: in progress
 Gaps found while using the app for real projects.
-- [ ] Start fresh installations in Deep mode while preserving saved choices; remove needless AI
+- [x] Start fresh installations in Deep mode while preserving saved choices; remove needless AI
       tool-discovery barriers, make long evidence readable in pages, and use the available Deep
       decompiler for batches. Align investigation prompts and contributor workflow with this behaviour.
       — claimed: Codex, branch feature/r2.9-deep-investigation
+      Verified with 1,423 passing tests (11 ignored), CLI build, clippy and repository checks;
+      synthetic Deep-engine and long-evidence regressions, plus headless UI screenshots.
 - [x] Each project chooses, per kind of action, what the builder's approvals get (allow, ask or
       refuse): reading the web, commands, files outside the project, pushing and publishing,
       deleting outside the project, system changes, other tools. Unset kinds follow Auto mode as
@@ -1264,6 +1266,9 @@ Owner: open · Status: in progress
 - [ ] Unreal 5 and Oodle: IoStore packages, unversioned properties and Oodle-compressed paks
 - [ ] Game files: save pictures from IoStore containers (needs the Unreal 5 support above)
 - [ ] Unreal: sounds and meshes out (so a Deep-mode rebuild needs no outside converter for them)
+- [ ] Encrypted game archives: support supplied keys for the supported archive variants, with
+      wrong-key and unsupported-format results. The current readers do not implement decryption;
+      removing a prompt prohibition does not make encrypted contents readable.
 
 ### R3.11 Single-file apps, game files and stand-in backends
 Owner: open · Status: in progress

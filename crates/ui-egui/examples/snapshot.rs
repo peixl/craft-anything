@@ -161,6 +161,18 @@ fn main() {
             a
         });
     }
+    for deep in [false, true] {
+        let name = if deep { "make-app-deep" } else { "make-app-clean" };
+        if want(name) {
+            render(&out, name, w, h, scale, move || {
+                let mut a = demo::app(demo::engine(Mode::Beginner, true));
+                a.settings.deep_mode = deep;
+                a.engine.session().settings.deep_mode = deep;
+                a.state.make.target = craft_anything_engine::workspace::TargetRef::Local { path: PathBuf::from("/samples/calculator") };
+                a
+            });
+        }
+    }
     if want("sidebar-folded") {
         render(&out, "sidebar-folded", w, h, scale, || {
             let mut a = demo::app(demo::engine(Mode::Beginner, true));

@@ -924,6 +924,7 @@ mod tests {
         assert!(other.active().is_err());
         std::fs::remove_file(&path).unwrap();
         let mut clean = crate::session::Session::isolated(&directory.path().join("clean"));
+        clean.deep_for_run = Some(false);
         clean.restore_targets(&[context]).unwrap();
         assert_eq!(clean.active().unwrap().target.id, target.id);
         assert!(clean.active().unwrap().target.bytes.is_empty());

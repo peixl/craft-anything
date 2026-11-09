@@ -128,14 +128,15 @@ Both modes drive the same engine.
 
 ## Clean room or Deep
 
-- **Clean room** (the default): nothing inside the original is read, not its code, files or page
+- **Clean room** (optional): nothing inside the original is read, not its code, files or page
   source. Craft Anything works from what you can see: pictures you add, the website as a visitor
   sees it (screenshots, visible text, measured layout, colours, fonts and spacing, menus opened)
   and, when you allow it, a picture of the app's window. Tools that would look inside are refused
   and say how to turn on Deep mode.
-- **Deep**: every tool is used, for your private use. A program's code and files are read with the
+- **Deep** (the default for new installations): every registered tool is available, for your private use. A program's code and files are read with the
   built-in engines (and Ghidra when it's installed), a website's JavaScript is read and its start
-  page watched, and the builder may use all of them.
+  page watched, and the builder may use all of them. Existing settings retain their saved mode;
+  upgrading does not turn an existing Clean room installation into Deep mode.
 
 Clean room is a rule about what Craft Anything offers and refuses. It is not an operating-system
 sandbox: it doesn't isolate your computer. A coding agent you run still acts as you, and what it can
@@ -145,6 +146,32 @@ refuse differs by agent; for Claude Code's tools in chats and questions, see
 
 Switch in the title bar or Settings, with `settings_set deep_mode true`, or for one CLI run with
 `--deep` (or `--clean-room`).
+
+### Long investigations
+
+The built-in AI enables a registered tool's group when it calls that tool. `list_toolsets` and
+`enable_toolset` still support discovery; `enable_toolset` also accepts `all`. An explicitly selected
+Clean room or project approval setting still applies to the call.
+
+For an API or local-model backend, add `unlimited_turns = true` to its existing `[[ai.backends]]`
+entry in `config.toml` to remove the per-message step limit. This overrides `max_turns`; cancellation,
+context management and stalled-build detection still work. Otherwise, a positive `max_turns` is
+honoured in both chat and builds. Unset limits remain 40 chat steps and 400 builder steps; old
+`max_turns = 0` settings keep their previous behaviour. External agent CLIs manage their own loops.
+
+Large results stay in the evidence ledger. To read a nested function from a batch without repeatedly
+truncating the full record, call `core_evidence_browse` with:
+
+```json
+{
+  "source": { "kind": "saved", "evidence_id": "ev_from_your_result" },
+  "show": { "kind": "path", "path": "/items/0/pseudo_code", "offset": 0, "limit": 64 }
+}
+```
+
+The path starts at the evidence's `result`. Continue with the returned `coverage.next_offset`;
+text offsets count UTF-16 units. `native_functions_decompile` uses the same available Deep engine
+or built-in fallback as a single-function decompile and reports each item's engine and limitations.
 
 <p align="center">
   <img src="docs/images/workbench.png" alt="The Advanced workbench: a function list, pseudo-C of the selected function, the agent answering a question with a tool call, and the evidence ledger" width="100%">

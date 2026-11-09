@@ -79,9 +79,14 @@ pub struct BackendOptions {
     /// Force the ReAct text protocol (models without tool calling).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub react_fallback: Option<bool>,
-    /// Most model turns per user message.
+    /// Most model turns per user message. Omitted uses 40 for chat or 400 for a builder;
+    /// legacy zero means one for chat or 400 for a builder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    /// Continue without a model-turn limit. Overrides `max_turns`; cancellation, context
+    /// budgets, process deadlines and the repeated failed-build stop still apply.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unlimited_turns: bool,
     /// Input tokens before trimming and summarising the conversation. Omitted or zero uses the
     /// local/cloud default; this does not change the model server's own context window.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,6 +128,20 @@ pub struct BackendOptions {
 }
 
 impl BackendOptions {
+    /// Normalize saved options before making a model slot. Internal zero means unlimited;
+    /// a saved `max_turns = 0` predates that option and keeps its earlier meaning.
+    pub(crate) fn model_turn_limit(&self, builder: bool) -> u32 {
+        if self.unlimited_turns {
+            return 0;
+        }
+        match self.max_turns {
+            Some(n) if n > 0 => n,
+            _ if builder => crate::agent::BUILDER_MAX_TURNS,
+            Some(_) => 1,
+            None => crate::agent::DEFAULT_MAX_TURNS,
+        }
+    }
+
     /// [`config_dir`](BackendOptions::config_dir) as written, if any (for another computer).
     pub fn config_dir_text(&self) -> Option<&str> {
         self.config_dir.as_deref().map(str::trim).filter(|d| !d.is_empty())
@@ -445,6 +464,33 @@ mod tests {
         }
         for line in ["context_tokens = -1", "context_tokens = \"8000\"", "context_tokens = 8.5"] {
             assert_eq!(AiConfig::from_table(&table(line)).unwrap_err().code, ErrorCode::BadSettings);
+        }
+    }
+
+    #[test]
+    fn turn_limits_keep_legacy_defaults_and_explicit_choices() {
+        for (line, chat, builder) in [
+            ("", 40, 400),
+            ("max_turns = 0", 1, 400),
+            ("max_turns = 3", 3, 3),
+            ("max_turns = 600", 600, 600),
+            ("unlimited_turns = true", 0, 0),
+            ("max_turns = 0\nunlimited_turns = true", 0, 0),
+            ("max_turns = 3\nunlimited_turns = true", 0, 0),
+            ("max_turns = 3\nunlimited_turns = false", 3, 3),
+        ] {
+            let table = toml::from_str(&format!("[[backends]]\nname = \"Local\"\nkind = \"openai_compatible\"\nmodel = \"test-model\"\n{line}")).unwrap();
+            let config = AiConfig::from_table(&table).unwrap();
+            let options = &config.backends[0].options;
+            assert_eq!((options.model_turn_limit(false), options.model_turn_limit(true)), (chat, builder), "{line}");
+            let saved = config.to_table().unwrap();
+            assert_eq!(AiConfig::from_table(&saved).unwrap(), config, "{line}");
+            assert_eq!(toml::to_string(&saved).unwrap().contains("unlimited_turns"), options.unlimited_turns, "false keeps old files unchanged");
+        }
+        assert!(!BackendOptions::default().unlimited_turns);
+        for line in ["unlimited_turns = 1", "unlimited_turns = \"true\"", "max_turns = -1"] {
+            let table = toml::from_str(&format!("[[backends]]\nname = \"Local\"\nkind = \"openai_compatible\"\nmodel = \"test-model\"\n{line}")).unwrap();
+            assert_eq!(AiConfig::from_table(&table).unwrap_err().code, ErrorCode::BadSettings);
         }
     }
 

@@ -91,7 +91,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "native_source_folder_write",
             "Write pseudo-C to a folder",
-            "Write each function of the active target as pseudo-C to its own file in a folder, across as many runs as it takes: running again with the same folder skips what's done and continues, and a state file records the target's SHA-256 (another target is refused) and each finished function. Each call stops at max_functions or max_seconds and says how far it got. Files are written atomically. Uses the built-in decompiler, as native_functions_decompile does. Refuses a folder with other files in it.",
+            "Write each function of the active target as pseudo-C to its own file in a folder, across as many runs as it takes: running again with the same folder skips what's done and continues, and a state file records the target's SHA-256 (another target is refused) and each finished function. Each call stops at max_functions or max_seconds and says how far it got. Files are written atomically. Uses the built-in decompiler; native_functions_decompile can use the Deep engine. Refuses a folder with other files in it.",
             "Save a whole program as readable code files, a part at a time.",
             Toolset::Native,
             Effects::MUTATES_SESSION | Effects::WRITES_FILESYSTEM | Effects::CARRIES_TARGET_CONTENT,
@@ -1088,7 +1088,7 @@ fn native_source_folder_write(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOu
     let capped = st.prog.discovery_capped();
     let mut lims = vec![Limitation::new(
         "pseudo_code_inferred",
-        "Pseudo-C from the built-in decompiler is register-level and approximate. Deep mode's Ghidra isn't used here, as in native_functions_decompile.",
+        "Pseudo-C from the built-in decompiler is register-level and approximate. Deep mode's Ghidra isn't used by this export; use native_functions_decompile for Deep decompilation.",
     )];
     if capped {
         lims.push(Limitation::new("discovery_capped", "Function discovery hit a limit on this program, so \"all\" means all the functions it found."));
