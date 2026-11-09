@@ -146,6 +146,16 @@ fn main() {
             a
         });
     }
+    if want("build-budgets") {
+        render(&out, "build-budgets", w, h, scale, || {
+            let mut a = demo::app(demo::engine(Mode::Beginner, true));
+            a.state.settings_open = true;
+            a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Builds;
+            a.settings.build.max_rounds = 30;
+            a.settings.build.max_pages = 40;
+            a
+        });
+    }
     if want("palette") {
         render(&out, "palette", w, h, scale, || {
             let mut a = demo::app(demo::engine(Mode::Experienced, true));

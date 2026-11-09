@@ -125,6 +125,10 @@ impl ChatModel for Busy {
 /// One run of the build (a request, or "Try again" when `message` is `None`), with a builder
 /// that keeps changing files and a check that never passes.
 fn run_busy_builder(ws: &mut Workspace, seen: &Arc<Mutex<usize>>, message: Option<&str>) -> ToolError {
+    run_busy_with_budget(ws, seen, message, 6, false)
+}
+
+fn run_busy_with_budget(ws: &mut Workspace, seen: &Arc<Mutex<usize>>, message: Option<&str>, max_rounds: u32, unlimited_rounds: bool) -> ToolError {
     let mut worker = check_worker(ws, false);
     let model = Busy { app: ws.app_dir(), turn: 0, seen: Arc::clone(seen) };
     let slot = ModelSlot { name: "Busy".into(), model: Box::new(model), local: true, effort: None, max_turns: 10, context_tokens: 0 };
@@ -142,8 +146,25 @@ fn run_busy_builder(ws: &mut Workspace, seen: &Arc<Mutex<usize>>, message: Optio
     };
     let mut kinds = KindRegistry::built_in();
     kinds.register(Arc::new(NeverBuilt));
-    let opts = RunOptions { message: message.map(str::to_string), continuing: message.is_none(), kinds, max_rounds: 6, ..RunOptions::default() };
+    let opts = RunOptions { message: message.map(str::to_string), continuing: message.is_none(), kinds, max_rounds, unlimited_rounds, ..RunOptions::default() };
     worker.run(ws, entry, Some(api), None, &opts).unwrap_err()
+}
+
+#[test]
+fn unlimited_rounds_pass_the_numeric_budget_but_keep_the_failed_check_guard() {
+    for (unlimited, expected) in [(false, 1usize), (true, NOT_WORKING_CHECK_LIMIT as usize)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(dir.path(), "Busy build", "Build an app", TargetRef::None).unwrap();
+        ws.manifest.stack = "Scripted stack".into();
+        ws.save().unwrap();
+        let seen = Arc::new(Mutex::new(0));
+        let error = run_busy_with_budget(&mut ws, &seen, Some("Build the app"), 0, unlimited);
+        assert_eq!(*seen.lock().unwrap(), expected);
+        assert_eq!(ws.manifest.checks.len(), expected);
+        if unlimited {
+            assert!(error.message.contains("checks in a row"), "{error:?}");
+        }
+    }
 }
 
 #[test]

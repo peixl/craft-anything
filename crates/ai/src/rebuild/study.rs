@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// web_site_open puts the final navigated URL in its evidence result; params describe the
+/// requested URL and must never be used to decide whether a redirect stayed in scope.
+fn opened_page_result(output: ToolOutput) -> Result<Value, ToolError> {
+    match output {
+        ToolOutput::Evidence(record) if record.operation == "web_site_open" => Ok(record.result),
+        _ => Err(ToolError::invalid("Navigation did not return web_site_open evidence.")),
+    }
+}
+
 /// An Electron program is the Chromium and Node runtime, and analysing that takes hours: the app's
 /// own logic is the JavaScript in `resources/app.asar` beside it, which the study maps (#947).
 pub(super) fn is_electron_runtime(program: &Path) -> bool {
@@ -189,54 +198,45 @@ impl Worker {
         Ok(notes)
     }
 
-    /// The site's other pages (up to `build.max_pages` same-site pages: links from the start
-    /// page, then links from those pages while there's room), each captured into
-    /// capture/routes/<name>/ and listed in capture/routes.json. A page that can't be captured is
-    /// left out; it never stops the study.
+    /// Breadth-first same-origin study, with explicit count/depth choices and a durable
+    /// report of captures, failures and resource boundaries.
     fn capture_routes(&mut self, ws: &mut Workspace, start: &str, widths: &[u32]) -> Result<(), ToolError> {
+        use craft_anything_engine::workspace::route_coverage::RouteResourceLimits;
+        use kinds::website::{RouteAction, capture_routes_with, read_bounded_json};
         let capture = ws.capture_dir();
-        let read = |dir: &Path| std::fs::read(dir.join("capture.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-        let found = read(&capture).unwrap_or(Value::Null);
-        let max = self.engine.session().settings.build.max_pages.min(kinds::website::MAX_ROUTES);
-        let picked = kinds::website::pick_routes(&found, start, max);
-        let mut kept = self.capture_pages(ws, &picked, widths)?;
-        // One level deeper: pages linked from the ones just captured, while there's room.
-        if kept.len() < max && !kept.is_empty() {
-            let captures: Vec<Value> = kept.iter().filter_map(|r| read(&capture.join("routes").join(&r.slug))).collect();
-            let deeper = kinds::website::pick_deeper_routes(&captures, start, &kept, max - kept.len());
-            kept.extend(self.capture_pages(ws, &deeper, widths)?);
-        }
-        if !kept.is_empty() {
-            let json = serde_json::to_vec_pretty(&kept).map_err(|e| ToolError::internal(e.to_string()))?;
-            craft_anything_engine::project::write_atomic(&capture.join(kinds::website::ROUTES_FILE), &json)?;
-        }
-        Ok(())
-    }
-
-    /// Capture each page into capture/routes/<slug>/; returns the ones that worked.
-    fn capture_pages(&mut self, ws: &mut Workspace, picked: &[kinds::website::Route], widths: &[u32]) -> Result<Vec<kinds::website::Route>, ToolError> {
-        let capture = ws.capture_dir();
-        let mut kept = Vec::new();
-        if !picked.is_empty() {
-            // web_site_capture creates its own folder, inside one that exists.
-            std::fs::create_dir_all(capture.join("routes")).map_err(|e| ToolError::io(capture.display(), e))?;
-        }
-        for (i, r) in picked.iter().enumerate() {
-            self.step(ws, Step::Study, Status::Inspecting, &format!("Photographing more pages ({} of {}): {}…", i + 1, picked.len(), r.path))?;
-            let dir = capture.join("routes").join(&r.slug);
-            let got = self.call("web_site_open", json!({"url": r.url})).and_then(|_| {
+        let limit = RouteResourceLimits::default().capture_json_bytes;
+        let found = read_bounded_json(&capture.join("capture.json"), limit)?;
+        let build = self.engine.session().settings.build.clone();
+        std::fs::create_dir_all(capture.join("routes")).map_err(|e| ToolError::io(capture.display(), e))?;
+        let stop = self.stop.clone();
+        let report = capture_routes_with(&capture, start, &found, &build, &stop, |action, route| match action {
+            RouteAction::Open => {
+                self.step(ws, Step::Study, Status::Inspecting, &format!("Photographing another page: {}…", route.path))?;
+                opened_page_result(self.call("web_site_open", json!({"url": route.url}))?)
+            }
+            RouteAction::Capture => {
+                let dir = capture.join("routes").join(&route.slug);
                 self.call(
                     "web_site_capture",
                     json!({"output_directory": dir.display().to_string(), "include_html": false, "widths": widths, "noise_pass": true}),
-                )
-            });
-            match got {
-                Ok(_) => kept.push(r.clone()),
-                // Said in the feed, not hidden: the page is left out and the study goes on.
-                Err(e) => self.step(ws, Step::Study, Status::Inspecting, &format!("Couldn't photograph {}: {}", r.path, e.message))?,
+                )?;
+                read_bounded_json(&dir.join("capture.json"), limit)
             }
+        })?;
+        if !report.boundaries.is_empty() {
+            self.step(
+                ws,
+                Step::Study,
+                Status::Inspecting,
+                &format!(
+                    "Captured {} additional pages from {} attempts; study boundaries: {}. Details are in capture/routes-coverage.json.",
+                    report.captured,
+                    report.attempted,
+                    report.boundaries.join(", ")
+                ),
+            )?;
         }
-        Ok(kept)
+        Ok(())
     }
 
     /// Deep mode with Ghidra installed: run Ghidra's one-time analysis of `program` on its own
@@ -294,5 +294,36 @@ pub(super) fn describe(out: &ToolOutput) -> String {
             format!("{}\n\nEvidence {}.\n\n```json\n{}\n```\n", e.summary, e.id, body.chars().take(20_000).collect::<String>())
         }
         ToolOutput::Value(v) => format!("```json\n{}\n```\n", serde_json::to_string_pretty(v).unwrap_or_default().chars().take(20_000).collect::<String>()),
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use craft_anything_evidence::{Environment, EvidenceBuilder, Subject};
+    use kinds::website::{RouteAction, capture_routes_with};
+
+    #[test]
+    fn redirects_use_the_navigation_evidence_result_not_the_requested_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested = "https://site.example/moved";
+        let evidence = EvidenceBuilder::new("web_site_open", Subject::default(), Environment::builtin(false))
+            .params(json!({"url": requested}))
+            .result(json!({"url": "https://other.example/", "facts": {"url": "https://other.example/"}}))
+            .build()
+            .unwrap();
+        let report = capture_routes_with(
+            dir.path(),
+            "https://site.example/",
+            &json!({"links": [{"href": requested}]}),
+            &Default::default(),
+            &CancelToken::default(),
+            |action, _| {
+                assert_eq!(action, RouteAction::Open, "do not capture the redirected page");
+                opened_page_result(ToolOutput::evidence(evidence.clone()))
+            },
+        )
+        .unwrap();
+        assert_eq!((report.attempted, report.captured, report.redirected_outside_origin), (1, 0, 1));
     }
 }

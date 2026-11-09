@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExportState",
+  "description": "What an export folder holds, by function entry.",
+  "type": "object",
+  "properties": {
+    "functions": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ExportedFunction"
+      }
+    },
+    "policy": {
+      "$ref": "#/$defs/ExportPolicy"
+    },
+    "target_name": {
+      "type": "string"
+    },
+    "target_sha256": {
+      "type": "string"
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "version",
+    "target_sha256",
+    "target_name",
+    "policy",
+    "functions"
+  ],
+  "$defs": {
+    "ExportPolicy": {
+      "oneOf": [
+        {
+          "description": "Prefer the Deep engine and fall back to the built-in lifter.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Use only the built-in lifter, including when resuming a legacy export.",
+          "type": "string",
+          "const": "builtin"
+        }
+      ]
+    },
+    "ExportProvenance": {
+      "type": "object",
+      "properties": {
+        "authority": {
+          "enum": [
+            "original-files",
+            "our-run",
+            "earlier-record",
+            "outside-service",
+            "reasoning"
+          ]
+        },
+        "confidence": {
+          "enum": [
+            "observed",
+            "derived",
+            "inferred"
+          ]
+        },
+        "entry": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "environment": {
+          "type": "object",
+          "properties": {
+            "clean_room": {
+              "type": "boolean"
+            },
+            "engine": {
+              "type": "string"
+            },
+            "engine_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "language_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "clean_room",
+            "engine",
+            "host"
+          ]
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        }
+      },
+      "required": [
+        "environment",
+        "confidence",
+        "authority",
+        "limitations"
+      ]
+    },
+    "ExportedFunction": {
+      "description": "One function that has been written.",
+      "type": "object",
+      "properties": {
+        "engine": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "lines": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "name": {
+          "type": "string"
+        },
+        "provenance": {
+          "description": "Older exports did not save these details; migration does not invent them.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExportProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "structured": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "file",
+        "name",
+        "lines",
+        "engine"
+      ]
+    }
+  }
+}

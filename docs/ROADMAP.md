@@ -829,6 +829,10 @@ Owner: open · Status: in progress
 - [ ] See whether Hermes still fails on 0.3.0 (#460: the fix its `fixed` label names was already in
       0.3.0 when it was filed, and it gives no version)
 
+- [ ] Preserve result evidence ids in adapters that omit them from Craft Anything tool
+      completion events. Without an attributable id, the rebuild reminder conservatively does
+      not count the event as successful analysis; historical ledger matches are not a substitute.
+
 **Approvals:**
 - [ ] **decision** One approval behaviour across agents, and whether we want an auto-approve mode
       apart from Clean room and Deep (Auto mode only governs what's asked through us). Today it
@@ -1025,6 +1029,13 @@ Gaps found while using the app for real projects.
       — claimed: Codex, branch feature/r2.9-deep-investigation
       Verified with 1,423 passing tests (11 ignored), CLI build, clippy and repository checks;
       synthetic Deep-engine and long-evidence regressions, plus headless UI screenshots.
+- [x] Continue analysis capability and workflow-budget work: explicit unlimited refinement/pages,
+      configurable route depth, successful target-scoped analysis coverage, resumable Deep source
+      export, and optional Ghidra setup that does not block the builtin path. Retain execution and
+      data-access permissions, legacy zero semantics and bounded retained data.
+      — claimed: Codex, branch feature/r2.9-deep-investigation
+      Verified: 1,582 tests passed (12 ignored), CLI build, clippy, repository checks and
+      English/Chinese settings screenshots using the CI-pinned font bundle.
 - [x] Each project chooses, per kind of action, what the builder's approvals get (allow, ask or
       refuse): reading the web, commands, files outside the project, pushing and publishing,
       deleting outside the project, system changes, other tools. Unset kinds follow Auto mode as
@@ -1293,8 +1304,12 @@ Owner: open · Status: in progress
 - [ ] Godot format 4 and IL2CPP metadata 38 and 39 are header-only; read their tables once a real
       file can be checked
 - [ ] Bun: take source maps and bytecode out as files; a standalone `.pyz`
-- [ ] `native_source_folder_write` uses the built-in decompiler only: use Ghidra in Deep mode when
-      it's there
+- [x] `native_source_folder_write` uses the shared Deep/builtin path for discovered candidates,
+      with resumable policy/provenance, explicit work budgets and bounded checkpoints
+      — claimed: Codex, branch feature/r2.9-deep-investigation (continued analysis-capability task)
+- [ ] Add genuinely paged Deep-engine function discovery before whole-program export uses that
+      catalogue; the current list response materializes the complete function list. Until then,
+      export uses the bounded builtin-discovered candidates and reports that coverage boundary.
 - [x] Keep stand-in response samples distinct when headers, content types or body-availability metadata differ.
       Compare header names without case and ignore ordering between different names, preserving each name's value order.
       At the sample cap, a usable answer can replace an unavailable 304 for the same path, query and request key;

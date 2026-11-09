@@ -164,7 +164,8 @@ pub fn pseudo_code(ctx: &mut Ctx<'_>, at: At, our_base: u64, params: serde_json:
         At::Ours(a) => rebase.to_engine(a),
         At::Engine(a) => a,
     };
-    match provider.decompile(entry) {
+    let cancel = ctx.cancel.clone();
+    match provider.decompile_controlled(entry, &|| cancel.is_cancelled()) {
         Ok(Some(df)) if df.pseudocode.as_deref().is_none_or(|code| code.trim().is_empty()) => {
             Err(Some("Ghidra found this function but returned no pseudo-C.".into()))
         }
@@ -173,7 +174,12 @@ pub fn pseudo_code(ctx: &mut Ctx<'_>, at: At, our_base: u64, params: serde_json:
             Ok(build_evidence(ctx, provider.as_ref(), df, rebase, &renames, params))
         }
         Ok(None) => Err(Some("Ghidra had no answer for this function.".into())),
-        Err(ghidra::GhidraError::Cancelled) => Ok(Err(ToolError::cancelled())),
+        Err(ghidra::GhidraError::Cancelled) => {
+            if let Ok(t) = ctx.session.active_mut() {
+                t.ext.remove::<DeepSlot>();
+            }
+            Ok(Err(ToolError::cancelled()))
+        }
         Err(e) => {
             log::warn!("Ghidra decompile failed; falling back to the built-in engine: {e}");
             // A dead bridge (Ghidra crashed or was killed) is started again on the next call; the
@@ -646,6 +652,126 @@ mod tests {
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
             assert!(!e.session().ledger().any(|ev| ev.operation == "native_functions_decompile"));
         }
+    }
+
+    #[test]
+    fn source_exports_use_deep_code_and_keep_their_selected_policy() {
+        let (elf, _) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &elf);
+        let moved = Arc::new(Moved { base: tk::ELF_BASE + 0x10_0000, asked: AtomicU64::new(0) });
+        with_deep(&e, moved.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("deep");
+        let result = call(&e, "native_source_folder_write", json!({"folder": folder, "unlimited": true}));
+        assert_eq!(result["result"]["engine_policy"], "auto");
+        assert_eq!(result["result"]["engines_used"], json!(["ghidra"]));
+        assert_eq!(result["result"]["finished"], true);
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(folder.join(super::super::program_facts_tools::EXPORT_STATE_FILE)).unwrap()).unwrap();
+        for record in state["functions"].as_object().unwrap().values() {
+            assert_eq!(record["engine"], "ghidra");
+            assert_eq!(record["provenance"]["environment"]["engine"], "ghidra");
+            assert_eq!(record["provenance"]["confidence"], "derived");
+            assert!(record["structured"].is_null());
+            let code = std::fs::read_to_string(folder.join(record["file"].as_str().unwrap())).unwrap();
+            assert!(code.contains("Reconstructed pseudo-C from ghidra") && code.contains("return 0;"));
+        }
+        moved.asked.store(0, Ordering::SeqCst);
+        let builtin = directory.path().join("builtin");
+        let result = call(&e, "native_source_folder_write", json!({"folder": builtin, "engine": "builtin"}));
+        assert_eq!(result["result"]["engines_used"], json!(["clean-room lifter"]));
+        assert_eq!(moved.asked.load(Ordering::SeqCst), 0, "the saved policy does not opportunistically change engines");
+    }
+
+    #[test]
+    fn source_exports_record_the_reason_for_missing_deep_code() {
+        let (elf, _) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &elf);
+        with_deep(&e, Arc::new(Incomplete { code: None }));
+        let folder = tempfile::tempdir().unwrap();
+        let result = call(&e, "native_source_folder_write", json!({"folder": folder.path()}));
+        assert_eq!(result["result"]["finished"], true);
+        assert_eq!(result["result"]["engines_used"], json!(["clean-room lifter"]));
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(folder.path().join(super::super::program_facts_tools::EXPORT_STATE_FILE)).unwrap()).unwrap();
+        for record in state["functions"].as_object().unwrap().values() {
+            assert!(
+                record["provenance"]["limitations"].as_array().unwrap().iter().any(|lim| lim["message"].as_str().is_some_and(|m| m.contains("no pseudo-C")))
+            );
+            assert!(std::fs::metadata(folder.path().join(record["file"].as_str().unwrap())).unwrap().len() > 0);
+        }
+    }
+
+    struct WaitAfterOne {
+        started: std::sync::mpsc::Sender<()>,
+        calls: AtomicUsize,
+    }
+
+    impl DeepDecompiler for WaitAfterOne {
+        fn engine(&self) -> &'static str {
+            "ghidra"
+        }
+        fn engine_version(&self) -> Option<String> {
+            None
+        }
+        fn decompile(&self, _: u64) -> Result<Option<DeepFunction>, ghidra::GhidraError> {
+            panic!("the tool must pass its cancellation signal to the controlled method")
+        }
+        fn decompile_controlled(&self, entry: u64, cancel: &dyn Fn() -> bool) -> Result<Option<DeepFunction>, ghidra::GhidraError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(Some(DeepFunction {
+                    entry,
+                    name: "first".into(),
+                    signature: None,
+                    pseudocode: Some("int first(void) { return 1; }".into()),
+                    created: false,
+                }));
+            }
+            self.started.send(()).unwrap();
+            let until = std::time::Instant::now() + Duration::from_secs(3);
+            while !cancel() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if cancel() { Err(ghidra::GhidraError::Cancelled) } else { Err(ghidra::GhidraError::Timeout("test stop was not delivered".into())) }
+        }
+        fn list_functions(&self) -> Result<Vec<DeepFunction>, ghidra::GhidraError> {
+            panic!("export discovery must not call the unpaged Deep catalogue")
+        }
+    }
+
+    #[test]
+    fn cancelling_an_in_flight_export_saves_written_files_and_resumes() {
+        let (elf, _) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &elf);
+        let (started, waiting) = std::sync::mpsc::channel();
+        let provider = Arc::new(WaitAfterOne { started, calls: AtomicUsize::new(0) });
+        with_deep(&e, provider.clone());
+        let folder = tempfile::tempdir().unwrap();
+        let cancel = crate::CancelToken::default();
+        let stop = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            stop.cancel();
+        });
+        let result = e.call(
+            "native_source_folder_write",
+            json!({"folder": folder.path(), "unlimited": true}),
+            crate::CallOptions::new(crate::Caller::Cli).with_cancel(cancel),
+        );
+        canceller.join().unwrap();
+        assert_eq!(result.unwrap_err().code, craft_anything_evidence::ErrorCode::Cancelled);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(folder.path().join(super::super::program_facts_tools::EXPORT_STATE_FILE)).unwrap()).unwrap();
+        let files = state["functions"].as_object().unwrap();
+        assert_eq!(files.len(), 1, "the first write was checkpointed before returning cancellation");
+        let saved = files.values().next().unwrap()["file"].as_str().unwrap();
+        let before = std::fs::read(folder.path().join(saved)).unwrap();
+        with_deep(&e, Arc::new(Moved { base: tk::ELF_BASE, asked: AtomicU64::new(0) }));
+        let resumed = call(&e, "native_source_folder_write", json!({"folder": folder.path(), "unlimited": true}));
+        assert_eq!(resumed["result"]["finished"], true);
+        assert_eq!(resumed["result"]["already_done"], 1);
+        assert_eq!(std::fs::read(folder.path().join(saved)).unwrap(), before);
     }
 
     #[test]

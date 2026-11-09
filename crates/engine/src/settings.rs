@@ -142,10 +142,16 @@ pub struct BuildSettings {
     pub good_enough: f64,
     /// Refinement rounds after the first build in the app (the CLI's `--rounds` sets its own).
     pub max_rounds: u32,
+    /// Refine until the checks pass or the run is stopped. Progress and failure guards still apply.
+    pub unlimited_rounds: bool,
     /// Widths (CSS px) a website and its rebuild are compared at.
     pub web_widths: Vec<u32>,
-    /// Other pages of a website studied and checked besides the start page.
+    /// Successfully captured other pages besides the start page; failed attempts don't consume it.
     pub max_pages: usize,
+    /// Traverse without a page-count budget; bounded capture storage and cancellation still apply.
+    pub unlimited_pages: bool,
+    /// Link depth from the start page (1 = its links). Zero removes this traversal-depth budget.
+    pub max_page_depth: usize,
     /// When set, an app or game must look at least this alike (percent) to the person's pictures
     /// (or the original running) to be good enough; unset, that likeness is only reported.
     pub picture_good_enough: Option<f64>,
@@ -155,11 +161,28 @@ pub struct BuildSettings {
 
 impl Default for BuildSettings {
     fn default() -> Self {
-        BuildSettings { good_enough: 90.0, max_rounds: 6, web_widths: vec![1440, 768, 390], max_pages: 4, picture_good_enough: None, parallel: 2 }
+        BuildSettings {
+            good_enough: 90.0,
+            max_rounds: 6,
+            unlimited_rounds: false,
+            web_widths: vec![1440, 768, 390],
+            max_pages: 4,
+            unlimited_pages: false,
+            max_page_depth: 2,
+            picture_good_enough: None,
+            parallel: 2,
+        }
     }
 }
 
 impl BuildSettings {
+    /// Resolve one caller's overrides without changing its historical numeric default. An
+    /// explicit number (including zero) opts out of inherited unlimited rounds; an explicit
+    /// unlimited choice wins over either number.
+    pub fn round_budget(&self, rounds: Option<u32>, unlimited: Option<bool>, legacy_default: u32) -> (u32, bool) {
+        (rounds.unwrap_or(legacy_default), unlimited.unwrap_or(self.unlimited_rounds && rounds.is_none()))
+    }
+
     /// The widths to compare at: the configured ones a capture can take (320-3840 px, at most 4),
     /// else the defaults (desktop, tablet and phone).
     pub fn widths(&self) -> Vec<u32> {
@@ -219,10 +242,10 @@ impl Default for Settings {
 }
 
 /// The current `config.toml` format version. Bumping it means appending a step to [`SETTINGS_STEPS`].
-pub const SETTINGS_VERSION: u32 = 4;
+pub const SETTINGS_VERSION: u32 = 5;
 
 /// The steps that bring an older `config.toml` forward; step `i` goes from version `i` to `i + 1`.
-const SETTINGS_STEPS: &[Step<toml::Table>] = &[settings_v0_to_v1, settings_v1_to_v2, settings_v2_to_v3, settings_v3_to_v4];
+const SETTINGS_STEPS: &[Step<toml::Table>] = &[settings_v0_to_v1, settings_v1_to_v2, settings_v2_to_v3, settings_v3_to_v4, settings_v4_to_v5];
 const _: () = assert!(SETTINGS_STEPS.len() == SETTINGS_VERSION as usize, "one step per config.toml version");
 
 /// Version 0 (no `version` key) has the same shape as version 1; only the number is new.
@@ -256,6 +279,12 @@ fn settings_v2_to_v3(_: &mut toml::Table) -> Result<(), String> {
 /// room, so make that choice explicit before applying the new defaults. Existing choices win.
 fn settings_v3_to_v4(table: &mut toml::Table) -> Result<(), String> {
     table.entry("deep_mode").or_insert(toml::Value::Boolean(false));
+    Ok(())
+}
+
+/// Version 5 adds explicit unlimited workflow choices and link depth. Serde supplies false,
+/// false and two for old files; existing numeric zeros and explicit choices are not rewritten.
+fn settings_v4_to_v5(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
@@ -497,7 +526,7 @@ mod tests {
         fresh.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), fresh);
 
-        for version in 0..SETTINGS_VERSION {
+        for version in 0..4 {
             let prefix = if version == 0 { String::new() } else { format!("version = {version}\n") };
             let legacy = read_settings(&prefix).unwrap();
             assert!(!legacy.deep_mode, "version {version} omitted Deep and used Clean room");
@@ -515,6 +544,7 @@ mod tests {
         }
         assert!(!read_settings("deep_mode = false\n[engines.ghidra]\nenabled = true\n").unwrap().deep_mode);
         assert!(read_settings(&format!("version = {SETTINGS_VERSION}\n")).unwrap().deep_mode);
+        assert!(read_settings("version = 4\n").unwrap().deep_mode, "version 4 already started fresh configurations in Deep");
         assert!(!read_settings("version = 999\n").unwrap().deep_mode, "future implicit defaults are unknown");
     }
 
@@ -554,6 +584,25 @@ auto_mode = true
         .unwrap();
         assert_eq!(old.build, BuildSettings::default());
         assert_eq!(old.build.picture_good_enough, None, "picture likeness is only reported unless set");
+    }
+
+    #[test]
+    fn workflow_budgets_preserve_old_zeros_and_resolve_explicit_choices() {
+        let old = read_settings("version = 4\ndeep_mode = false\n[build]\nmax_rounds = 0\nmax_pages = 0\n").unwrap();
+        assert!(!old.deep_mode && !old.build.unlimited_rounds && !old.build.unlimited_pages);
+        assert_eq!((old.build.max_rounds, old.build.max_pages, old.build.max_page_depth), (0, 0, 2));
+        let mut settings = old;
+        settings.build.unlimited_rounds = true;
+        settings.build.unlimited_pages = true;
+        settings.build.max_page_depth = 0;
+        let loaded = read_settings(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded, settings);
+        assert_eq!(loaded.build.round_budget(None, None, 2), (2, true));
+        assert_eq!(loaded.build.round_budget(Some(0), None, 2), (0, false));
+        assert_eq!(loaded.build.round_budget(Some(3), None, 2), (3, false));
+        assert_eq!(loaded.build.round_budget(Some(3), Some(true), 2), (3, true));
+        assert_eq!(loaded.build.round_budget(None, Some(false), 2), (2, false));
+        assert_eq!(BuildSettings::default().round_budget(None, None, 2), (2, false));
     }
 
     use super::*;

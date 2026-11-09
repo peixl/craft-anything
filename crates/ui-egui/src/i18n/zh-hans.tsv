@@ -1462,3 +1462,6 @@ In this project, {kind}: {choice}.	在这个项目中，{kind}：{choice}。
 Couldn't change the approvals:	无法更改审批：
 What the builder may do without asking you, in this project.	在这个项目中，构建助手无需问你就可以做的事。
 Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	默认跟随自动模式：开启时，可撤销的操作会执行，其余的会被拒绝；关闭时，构建助手会询问。
+Unlimited	不限
+Website depth	网站探索深度
+Link levels to explore. Zero means no depth limit.	要探索的链接层数。0 表示不限深度。

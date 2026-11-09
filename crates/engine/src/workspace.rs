@@ -27,6 +27,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub mod progress;
+pub mod route_coverage;
 
 pub const MANIFEST: &str = "craft.json";
 

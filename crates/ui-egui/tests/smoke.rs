@@ -204,21 +204,25 @@ fn turning_on_generated_assets_without_a_fal_key_asks_for_one() {
 }
 
 #[test]
-fn deep_mode_without_ghidra_asks_to_get_it_before_using_it() {
+fn deep_mode_without_ghidra_starts_and_setup_stays_optional() {
+    use craft_anything_ai::rebuild::StandIns;
     use craft_anything_engine::workspace::TargetRef;
     use craft_anything_engines::game::{Builder, Installed, Inventory};
     use craft_anything_ui_egui::state::Modal;
     let d = tempfile::tempdir().unwrap();
-    let (store, game) = (d.path().join("engines"), d.path().join("game"));
+    let (store, game, projects) = (d.path().join("engines"), d.path().join("game"), d.path().join("projects"));
+    let runs = StandIns::new();
+    let standins = runs.clone();
     std::fs::create_dir_all(&game).unwrap();
     // Tall enough to show Start below the Clean room / Deep, engine and asset choices.
     let mut h = harness_sized(egui::vec2(1280.0, 1120.0), move || {
-        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        let mut a = stand_in_app(projects, &standins);
         a.settings.deep_mode = false;
         a.engine.session().settings.deep_mode = false;
         demo::fill_projects(&mut a);
         // An empty engine store: no Ghidra here.
         a.settings.engines.store_dir = Some(store);
+        a.settings.engines.only_configured = true;
         a.state.make.target = TargetRef::Local { path: game };
         a.state.make.game = true;
         a.state.make.request = "Recreate this game".into();
@@ -231,10 +235,16 @@ fn deep_mode_without_ghidra_asks_to_get_it_before_using_it() {
         a
     });
     h.run_steps(3);
-    // An app or a game offers Clean room or Deep right on the Make screen; picking Deep offers
-    // Ghidra instead of quietly going without it.
+    // Deep works immediately. The optional engine's setup is opened only by its own button.
     h.get_by_label("How closely may Craft Anything look at it?");
     h.get_by_label("Deep").click();
+    h.run_steps(3);
+    assert_eq!(h.state().state.modal, None);
+    h.get_by_label("Get Ghidra").scroll_to_me();
+    h.run_steps(20);
+    h.get_by_label("Get Ghidra").hover();
+    h.run_steps(2);
+    h.get_by_label("Get Ghidra").click();
     h.run_steps(3);
     assert_eq!(h.state().state.modal, Some(Modal::Ghidra));
     h.get_by_label("Get Ghidra for Deep mode");
@@ -246,12 +256,16 @@ fn deep_mode_without_ghidra_asks_to_get_it_before_using_it() {
     h.run_steps(3);
     assert_eq!(h.state().state.modal, None);
     assert!(h.state().settings.deep_mode && h.state_mut().ghidra_missing(), "Deep stays on, without Ghidra");
-    // Starting a build of a program asks again, and the project waits for the answer.
+    // Starting uses the existing engine path, without an install question or a download.
     h.get_by_label("Start").click();
-    h.run_steps(4);
-    assert_eq!(h.state().state.modal, Some(Modal::Ghidra));
-    assert!(h.state().ghidra.start_after.is_some(), "the build starts once Ghidra is ready");
-    h.get_by_label("Build without it");
+    assert!(wait(&mut h, |a| a.creating.is_none() && a.workspace.is_some()));
+    assert_eq!(h.state().state.modal, None);
+    assert!(h.state().ghidra.start_after.is_none() && h.state().ghidra.job.is_none());
+    let root = h.state().workspace.as_ref().unwrap().root.clone();
+    assert_eq!(runs.started(), std::slice::from_ref(&root));
+    h.state_mut().pause();
+    assert!(runs.finish(&root));
+    h.run_steps(2);
 }
 
 /// A game's chosen folder is shown like every chosen folder: cut to fit its row, never widening the
@@ -932,16 +946,64 @@ fn mode_switch_and_deep_toggle() {
     assert!(wait(&mut h, |a| a.engine.try_session().is_some_and(|s| s.settings.mode == Mode::Experienced)));
     h.state_mut().set_deep(true);
     assert!(wait(&mut h, |a| a.engine.try_session().is_some_and(|s| s.settings.deep_mode && !s.clean_room())));
-    // No Ghidra in the store: Deep mode offers it first. (Hover first, as a mouse does: the
-    // dialog's button only takes a click once the pointer has been over it for a frame.)
-    h.get_by_label("Not now").hover();
-    h.run_steps(2);
-    h.get_by_label("Not now").click();
-    h.run_steps(3);
-    assert_eq!(h.state().state.modal, None, "Not now closes it");
+    assert_eq!(h.state().state.modal, None, "switching modes does not require installing an optional engine");
     h.get_by_label("Simple").click();
     h.run_steps(3);
     assert_eq!(h.state().settings.mode, Mode::Beginner);
+}
+
+#[test]
+fn workflow_budget_controls_keep_saved_numbers_when_unlimited_is_selected() {
+    let mut h = harness_sized(egui::vec2(1280.0, 1000.0), || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.settings.build.max_rounds = 30;
+        a.settings.build.max_pages = 40;
+        a.settings.build.max_page_depth = 0;
+        a.state.settings_open = true;
+        a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Builds;
+        a
+    });
+    h.run_steps(3);
+    assert_eq!((h.state().settings.build.max_rounds, h.state().settings.build.max_pages), (30, 40));
+    h.get_by_label("Website depth");
+    h.get_by_label("Link levels to explore. Zero means no depth limit.");
+    assert_eq!(h.get_all_by_label("Unlimited").count(), 2);
+    h.get_all_by_label("Unlimited").next().unwrap().click();
+    h.run_steps(3);
+    assert!(h.state().settings.build.unlimited_rounds);
+    h.get_all_by_label("Unlimited").nth(1).unwrap().click();
+    h.run_steps(3);
+    assert!(h.state().settings.build.unlimited_pages);
+    assert_eq!((h.state().settings.build.max_rounds, h.state().settings.build.max_pages, h.state().settings.build.max_page_depth), (30, 40, 0));
+    h.get_all_by_label("Unlimited").next().unwrap().click();
+    h.run_steps(3);
+    assert!(!h.state().settings.build.unlimited_rounds);
+    assert_eq!(h.state().settings.build.max_rounds, 30, "turning off unlimited restores the selected finite budget");
+}
+
+#[test]
+fn large_saved_workflow_counts_survive_settings_render_and_toml_round_trip() {
+    let largest = usize::try_from(i64::MAX).unwrap_or(usize::MAX);
+    let mut h = harness_sized(egui::vec2(1280.0, 1000.0), move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.settings.build.max_pages = largest;
+        a.settings.build.max_page_depth = largest;
+        a.state.settings_open = true;
+        a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Builds;
+        a
+    });
+    h.run_steps(3);
+    assert_eq!((h.state().settings.build.max_pages, h.state().settings.build.max_page_depth), (largest, largest));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    h.state().settings.save_to(&path).unwrap();
+    let loaded = craft_anything_engine::Settings::load_from(&path);
+    assert_eq!((loaded.build.max_pages, loaded.build.max_page_depth), (largest, largest));
+    // The maximum editable f64-exact count also round-trips without a signed-integer overflow.
+    let editable = usize::try_from((1u64 << 53) - 1).unwrap_or(usize::MAX);
+    h.state_mut().settings.build.max_pages = editable;
+    h.state().settings.save_to(&path).unwrap();
+    assert_eq!(craft_anything_engine::Settings::load_from(&path).build.max_pages, editable);
 }
 
 #[test]

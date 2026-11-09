@@ -1462,3 +1462,6 @@ In this project, {kind}: {choice}.	이 프로젝트에서 {kind}: {choice}.
 Couldn't change the approvals:	승인을 바꾸지 못했습니다:
 What the builder may do without asking you, in this project.	이 프로젝트에서 빌더가 묻지 않고 해도 되는 일입니다.
 Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	기본값은 자동 모드를 따릅니다. 켜져 있으면 되돌릴 수 있는 일은 진행하고 나머지는 거부하며, 꺼져 있으면 빌더가 묻습니다.
+Unlimited	제한 없음
+Website depth	웹사이트 탐색 깊이
+Link levels to explore. Zero means no depth limit.	탐색할 링크 단계 수입니다. 0은 깊이 제한이 없음을 뜻합니다.

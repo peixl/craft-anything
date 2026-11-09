@@ -1462,3 +1462,6 @@ In this project, {kind}: {choice}.	Neste projeto, {kind}: {choice}.
 Couldn't change the approvals:	Não foi possível alterar as aprovações:
 What the builder may do without asking you, in this project.	O que o agente pode fazer sem perguntar a você, neste projeto.
 Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	A opção Padrão segue o Modo automático: com ele ativado, o que pode ser desfeito é executado e o restante é recusado; com ele desativado, o agente pergunta antes.
+Unlimited	Sem limite
+Website depth	Profundidade do site
+Link levels to explore. Zero means no depth limit.	Quantos níveis de links explorar. Zero significa sem limite de profundidade.

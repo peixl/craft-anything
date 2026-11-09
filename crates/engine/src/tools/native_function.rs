@@ -382,6 +382,15 @@ fn native_function_pseudocode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOu
 /// The same address resolution, Deep engine and fallback for one function or a batch. This
 /// returns evidence directly: callers do not dispatch another tool while holding the session.
 pub(super) fn decompile(ctx: &mut Ctx<'_>, p: &ProcParams) -> Result<Evidence, ToolError> {
+    decompile_with(ctx, p, true)
+}
+
+/// Resume an export that explicitly chose the built-in engine, without changing session mode.
+pub(super) fn decompile_builtin(ctx: &mut Ctx<'_>, p: &ProcParams) -> Result<Evidence, ToolError> {
+    decompile_with(ctx, p, false)
+}
+
+fn decompile_with(ctx: &mut Ctx<'_>, p: &ProcParams, use_deep: bool) -> Result<Evidence, ToolError> {
     ctx.cancel.check()?;
     select_document(ctx, &p.document)?;
     // Resolve the function entry in a scoped borrow so the deep hook can take `&mut ctx`. The
@@ -396,7 +405,7 @@ pub(super) fn decompile(ctx: &mut Ctx<'_>, p: &ProcParams) -> Result<Evidence, T
         let our_base = st.img.bin.image_base;
         match resolve_function(t, &st.prog, &p.function) {
             Ok(f) => (super::deep::At::Ours(f.entry), our_base, None),
-            Err(e) => match ghidra_address(&p.function).filter(|_| !ctx.session.clean_room()) {
+            Err(e) => match ghidra_address(&p.function).filter(|_| use_deep && !ctx.session.clean_room()) {
                 Some(a) if is_ghidra_name(&p.function) => (super::deep::At::Engine(a), our_base, Some(e)),
                 Some(a) => (super::deep::At::Ours(a), our_base, Some(e)),
                 None => return Err(e),
@@ -405,7 +414,7 @@ pub(super) fn decompile(ctx: &mut Ctx<'_>, p: &ProcParams) -> Result<Evidence, T
     };
     // Deep mode (Ghidra) is preferred through this same tool id when it is on and available;
     // otherwise, and whenever anything about it fails, we use the built-in clean-room lifter.
-    let deep = super::deep::pseudo_code(ctx, at, our_base, params_json(p));
+    let deep = if use_deep { super::deep::pseudo_code(ctx, at, our_base, params_json(p)) } else { Err(None) };
     // Startup and decompilation can take time. A stop during either must not turn into a
     // successful built-in fallback, even when the bridge only returned an unavailable reason.
     ctx.cancel.check()?;

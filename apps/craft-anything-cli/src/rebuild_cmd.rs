@@ -42,9 +42,13 @@ pub struct RebuildArgs {
     /// such as `Claude Code`).
     #[arg(long)]
     pub backend: Option<String>,
-    /// Refinement rounds after the first build.
-    #[arg(long, default_value_t = 2)]
-    pub rounds: u32,
+    /// Refinement rounds after the first build (default 2). An explicit value, including zero,
+    /// overrides the unlimited-rounds setting unless --unlimited-rounds is also supplied.
+    #[arg(long)]
+    pub rounds: Option<u32>,
+    /// Refine until checks pass or the run is stopped; progress/failure guards still apply.
+    #[arg(long)]
+    pub unlimited_rounds: bool,
     /// Answer questions with the first choice and refuse approvals, without asking.
     #[arg(long)]
     pub unattended: bool,
@@ -135,14 +139,16 @@ fn run(cli: &Cli, a: &RebuildArgs) -> Result<bool, ToolError> {
     let replacement = rebuild::builder_replacement(&hub.config(), &ws, a.backend.as_deref());
     // A follow-up shows in the project's feed as the person typed it.
     let shown = message.clone();
-    let good_enough = engine.session().settings.build.good_enough;
+    let build = engine.session().settings.build.clone();
+    let (max_rounds, unlimited_rounds) = build.round_budget(a.rounds, a.unlimited_rounds.then_some(true), 2);
     let opts = RunOptions {
         backend: a.backend.clone(),
         message,
         shown,
         continuing: a.resume,
-        max_rounds: a.rounds,
-        good_enough,
+        max_rounds,
+        unlimited_rounds,
+        good_enough: build.good_enough,
         beginner: !cli.json,
         clean_room: Some(engine.session().clean_room()),
         ..RunOptions::default()
@@ -277,6 +283,29 @@ fn prompt_answer(r: &Request) -> Answer {
             let _ = std::io::stdout().flush();
             let line = read_line().to_lowercase();
             Answer { allow: Some(line.starts_with('y') || line.starts_with('a')), always: line.starts_with('a'), ..Default::default() }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn explicit_cli_round_choices_override_inherited_unlimited() {
+        let settings = craft_anything_engine::settings::BuildSettings { unlimited_rounds: true, ..Default::default() };
+        for (flags, expected) in [
+            (vec![], (2, true)),
+            (vec!["--rounds", "0"], (0, false)),
+            (vec!["--rounds", "3"], (3, false)),
+            (vec!["--rounds", "3", "--unlimited-rounds"], (3, true)),
+        ] {
+            let mut args = vec!["craft-anything-cli", "rebuild", "-", "Build notes"];
+            args.extend(flags);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let crate::Command::Rebuild(run) = cli.command else { panic!("not a rebuild") };
+            assert_eq!(settings.round_budget(run.rounds, run.unlimited_rounds.then_some(true), 2), expected);
         }
     }
 }

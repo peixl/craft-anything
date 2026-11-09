@@ -1462,3 +1462,6 @@ In this project, {kind}: {choice}.	В этом проекте {kind}: {choice}.
 Couldn't change the approvals:	Не удалось изменить разрешения:
 What the builder may do without asking you, in this project.	Что конструктор может делать в этом проекте, не спрашивая вас.
 Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	«По умолчанию» следует авторежиму: когда он включён, то, что можно отменить, выполняется, а остальное отклоняется; когда выключен, конструктор спрашивает.
+Unlimited	Без ограничений
+Website depth	Глубина обхода сайта
+Link levels to explore. Zero means no depth limit.	Сколько уровней ссылок обходить. Ноль означает отсутствие ограничения глубины.

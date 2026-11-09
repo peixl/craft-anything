@@ -87,6 +87,11 @@ names (`git merge-base --is-ancestor <fix> <release tag>`), and check the messag
 
 ## Tests
 
+**A display selector was treated as evidence content.** Native evidence deliberately removes `document`
+from its canonical parameters, so hashing that selector into completion checks rejected a valid result.
+Keep call/document attribution separate from canonical analysis parameters. A completion without an
+evidence id cannot borrow an older matching record; test two targets with the same function name.
+
 **A stronger fresh default leaked into recovery.** Moving an unreadable config to `.broken` and
 returning conservative settings only protected the first load: the next read saw no config and
 used the new default. Treat the backup as a recovery marker until settings are explicitly saved.

@@ -173,6 +173,14 @@ The path starts at the evidence's `result`. Continue with the returned `coverage
 text offsets count UTF-16 units. `native_functions_decompile` uses the same available Deep engine
 or built-in fallback as a single-function decompile and reports each item's engine and limitations.
 
+For longer builds and studies, `[build]` supports `unlimited_rounds`, `unlimited_pages` and
+`max_page_depth` (`0` removes the depth budget). CLI builds accept `--unlimited-rounds`.
+`native_source_folder_write` can use the same Deep decompiler and run without a per-call work budget
+with `unlimited: true`. Existing zero values and saved export policies keep their meaning.
+See [analysis coverage and budgets](docs/analysis-budgets.md) for controls, precedence and reported
+resource boundaries. Missing optional Ghidra does not block the builtin path; its installation
+remains available through the explicit setup controls.
+
 <p align="center">
   <img src="docs/images/workbench.png" alt="The Advanced workbench: a function list, pseudo-C of the selected function, the agent answering a question with a tool call, and the evidence ledger" width="100%">
   <br>
