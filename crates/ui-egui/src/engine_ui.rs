@@ -182,7 +182,7 @@ pub fn deep_needed(app: &mut CraftApp, ui: &mut Ui) {
     );
     ui.vertical_centered(|ui| {
         if widgets::primary_icon(ui, Some("microscope"), "Turn on Deep mode", true).clicked() {
-            // Closes the dialog this is in, if it is in one; Deep mode may offer Ghidra next.
+            // Closes this dialog; optional engine setup remains a separate action.
             app.state.modal = None;
             app.set_deep(true);
         }

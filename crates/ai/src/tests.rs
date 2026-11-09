@@ -747,6 +747,52 @@ fn a_backend_context_budget_reaches_the_model() {
     assert_eq!(saved.get("Local").unwrap().options.context_tokens, Some(8000));
 }
 
+#[test]
+fn saved_turn_limits_reach_chat_and_the_builder() {
+    let (hub, dir) = hub();
+    for (max_turns, unlimited_turns, expected) in [(None, false, 40), (Some(0), false, 1), (Some(3), false, 3), (Some(3), true, 0)] {
+        let entry = BackendEntry {
+            config: BackendConfig {
+                name: "Local".into(),
+                kind: BackendKind::OpenaiCompatible,
+                model: "test-model".into(),
+                base_url: Some("http://127.0.0.1:0/v1".into()),
+                ssh_host: None,
+                enabled: true,
+            },
+            options: BackendOptions { max_turns, unlimited_turns, ..Default::default() },
+        };
+        hub.add_backend_with(entry, None).unwrap();
+        let slot = hub.build_model(&hub.entry("Local").unwrap()).unwrap();
+        assert_eq!(slot.max_turns, expected);
+        let saved = AiConfig::from_settings(&Settings::load_from(&dir.path().join("config.toml")));
+        let options = &saved.get("Local").unwrap().options;
+        assert_eq!((options.max_turns, options.unlimited_turns), (max_turns, unlimited_turns));
+    }
+
+    // A real API-loop builder observes a positive cap below its old fixed minimum of 400.
+    let response = chat_sse(&[
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"inspect","type":"function","function":{"name":"core_session_show","arguments":"{}"}}]}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+    ]);
+    let (url, seen) = mock(vec![(200, "text/event-stream", response)]);
+    let entry = BackendEntry {
+        config: BackendConfig {
+            name: "Builder".into(),
+            kind: BackendKind::OpenaiCompatible,
+            model: "test-model".into(),
+            base_url: Some(url),
+            ssh_host: None,
+            enabled: true,
+        },
+        options: BackendOptions { max_turns: Some(1), ..Default::default() },
+    };
+    let mut builder: Box<dyn Conversation> = Box::new(hub.start_builder(&entry, false, None, true).unwrap());
+    let events = run(&mut builder, "Inspect the current session");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("after 1 steps"))), "{events:?}");
+}
+
 /// #374: a remote OpenAI-compatible service was treated as a local model: a 24K-token context
 /// and a cost of nothing. Only a server on this computer or its network is local.
 #[test]

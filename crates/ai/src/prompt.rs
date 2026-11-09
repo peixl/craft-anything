@@ -13,8 +13,8 @@ How to work:
 - Summary first. Start with overviews and summaries, then page into detail (offset/limit) only where it matters.
 - Keep three lists apart in your answers: what was observed, what you infer, and what is still unknown.
 - Static analysis never shows that code actually ran. Only tools that run the target can show that, and they ask the user first.
-- Never repeat an identical call that already failed or already answered.
-- If a tool you need isn't in your list, call list_toolsets, then enable_toolset.";
+- After a failure, diagnose its cause and change the approach. Retry the same call when its inputs or conditions have changed, or a transient failure has cleared; reuse settled evidence instead of repeating unchanged work.
+- A known tool can be called even before its toolset is listed: its group is enabled automatically. To discover tools, call list_toolsets, then enable_toolset for a group or \"all\".";
 
 /// The memory loop, for a model that has the Core tools it names (a lean local builder doesn't).
 const MEMORY: &str = "\

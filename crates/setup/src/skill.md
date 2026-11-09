@@ -30,7 +30,8 @@ instead; that is faster and more direct.
   with `--all-tools`.
 - Only a small core toolset is listed at first. Call `list_toolsets` to see the others and
   `enable_toolset` to switch one on (native code, Android, Apple, web, runtime…).
-- In Clean room (Deep mode off, the default) nothing inside a target is read: only the tools that
+- New installations start in Deep mode; existing saved choices are preserved. In explicitly selected
+  Clean room (Deep mode off), nothing inside a target is read: only the tools that
   work from outside are listed, and others are refused with `details.reason` `clean_room`. Tell the
   user the question needs Deep mode (the switch in the app, `settings_set deep_mode true`, or the
   server started with `--deep`) instead of working around it.

@@ -5,8 +5,7 @@
 use super::native_common::{from_report, hex, image, native, params_json, resolve_function, select_document, spec, user_names};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
 use craft_anything_analysis::native as an;
-use craft_anything_disasm::pseudo::lift;
-use craft_anything_evidence::{Confidence, Coverage, Limitation, Location, ToolError};
+use craft_anything_evidence::{Confidence, Coverage, ErrorCode, Limitation, ToolError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -75,10 +74,10 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "native_functions_decompile",
             "Decompile many",
-            "Pseudo-C for several functions at once (up to 64); each item succeeds or fails on its own.",
+            "Pseudo-C for several functions at once (up to 64), using the same Deep engine or built-in fallback as a single decompile; each item records its engine and succeeds or fails on its own.",
             "Read several functions as C-like code at once.",
             Native,
-            e | Effects::CARRIES_TARGET_CONTENT,
+            e | Effects::CARRIES_TARGET_CONTENT | Effects::LAUNCHES_PROCESS,
             t,
             schema_of::<BatchParams>,
             native_functions_decompile,
@@ -520,34 +519,51 @@ fn native_functions_decompile(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOu
     if p.addresses.len() > 64 {
         return Err(ToolError::invalid("at most 64 functions per batch"));
     }
-    let st = native(ctx)?;
-    let t = ctx.session.active()?;
-    let user = user_names(t);
-    let names = |a: u64| user.get(&a).cloned();
+    native(ctx)?;
     let mut items = Vec::new();
     let mut ok = 0;
     let mut locations = Vec::new();
     for (i, a) in p.addresses.iter().enumerate() {
         ctx.cancel.check()?;
         ctx.report(Some(i as f32 / p.addresses.len().max(1) as f32), format!("decompiling {a}"));
-        match resolve_function(t, &st.prog, a) {
-            Ok(f) => {
-                let ps = lift(&st.img, &st.prog, f, &names);
+        let function = super::native_function::ProcParams { document: None, function: a.clone() };
+        match super::native_function::decompile(ctx, &function) {
+            Ok(evidence) => {
                 ok += 1;
-                locations.push(Location::address(f.entry));
-                items.push(json!({"input": a, "ok": true, "entry": hex(f.entry), "signature": ps.signature, "pseudo_code": ps.text, "structured": ps.structured, "limitations": ps.limitations.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>()}));
+                locations.extend(evidence.locations);
+                // Keep the original batch fields, including limitation codes. Add the engine's
+                // own result fields and provenance instead of claiming every item is built-in.
+                let Value::Object(mut item) = evidence.result else {
+                    return Err(ToolError::internal("The decompiler did not return a structured result."));
+                };
+                item.insert("input".into(), json!(a));
+                item.insert("ok".into(), json!(true));
+                item.entry("structured").or_insert(Value::Null);
+                item.insert("limitations".into(), json!(evidence.limitations.iter().map(|l| &l.code).collect::<Vec<_>>()));
+                item.insert("limitation_details".into(), json!(evidence.limitations));
+                item.insert("environment".into(), json!(evidence.environment));
+                item.insert("confidence".into(), json!(evidence.confidence));
+                item.insert("authority".into(), json!(evidence.authority));
+                item.insert("carries_target_content".into(), json!(evidence.carries_target_content));
+                items.push(Value::Object(item));
             }
-            Err(e) => items.push(json!({"input": a, "ok": false, "error": e.message})),
+            Err(e) if e.code == ErrorCode::Cancelled => return Err(e),
+            Err(e) => items.push(json!({"input": a, "ok": false, "error": e.message, "code": e.code, "remediation": e.remediation})),
         }
     }
+    ctx.cancel.check()?;
     let n = p.addresses.len();
     let e = super::native_common::ev(ctx, "native_functions_decompile", params_json(&p))?
         .result(json!({"items": items, "succeeded": ok, "failed": n - ok}))
         .summary(format!("Decompiled {ok} of {n} functions."))
         .confidence(Confidence::Inferred)
+        .target_content(true)
         .coverage(Coverage::complete(n as u64))
         .locations(locations)
-        .limitation(Limitation::new("pseudo_code_inferred", "pseudo-C from the clean-room lifter is register-level and approximate"))
+        .limitation(Limitation::new(
+            "pseudo_code_inferred",
+            "Pseudo-C is reconstructed code, not the original source; each item names its engine and limitations.",
+        ))
         .build()?;
     Ok(ToolOutput::evidence(e))
 }
@@ -724,6 +740,13 @@ mod tests {
         let r = call(&e, "native_functions_decompile", json!({"addresses": ["main", "helper", "nope"]}));
         assert_eq!(r["result"]["succeeded"], 2);
         assert_eq!(r["result"]["failed"], 1);
+        assert_eq!(r["carries_target_content"], true);
+        for item in r["result"]["items"].as_array().unwrap().iter().take(2) {
+            assert_eq!(item["engine"], "clean-room lifter");
+            assert!(item["structured"].is_boolean());
+            assert!(item["limitations"].as_array().unwrap().iter().any(|code| code == "deep_engine_unavailable"));
+            assert!(item["limitation_details"].as_array().unwrap().iter().any(|l| l["message"].as_str().is_some_and(|s| s.contains("isn't installed"))));
+        }
         let r = call(&e, "native_name_xrefs_list", json!({"name": "helper"}));
         assert_eq!(r["result"]["references"].as_array().unwrap().len(), 1);
         let r = call(&e, "native_api_show", json!({"function": "main"}));

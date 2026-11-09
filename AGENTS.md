@@ -4,10 +4,12 @@ Craft Anything is a native, pure-Rust app that shows anyone how a piece of softw
 websites, phones) with evidence-backed answers, then helps them rebuild it. It ships a desktop app (egui), a CLI and
 an MCP server, all driven by one engine. Display name **Craft Anything**; machine names `craft-anything-*`; bundle id
 `ai.storyteller.craft-anything`. Standards shared across the Crafting Apps live in `../craftrules` (read its
-`AGENTS.md`); follow them. Repos never share code.
+`AGENTS.md` when that checkout is available); follow them. If it is absent, use this file and
+`docs/pitfalls.md` and keep working rather than blocking on an optional sibling checkout.
 
-**Original work only:** never copy code, scripts, schemas, names, assets or wording from another project, and
-never name other reverse-engineering products in source, docs, UI or commit messages.
+**Traceable implementation:** use project-native code and established interfaces. Reuse material the user
+provides or authorizes with its provenance recorded; name external tools accurately when that helps explain
+an integration or result. Evidence must distinguish recovered content from newly written implementation.
 
 ## Workspace map
 
@@ -46,10 +48,11 @@ Layering is enforced by `cargo xtask layers`. Register new crates in `xtask/src/
    never open dialogs.
 3. **Evidence is the result.** Analysis tools return `ToolOutput::Evidence` built with `EvidenceBuilder` (honest
    confidence, limitations, coverage, locations). Large results: summary first, paged views (`offset`/`limit`).
-4. **Clean room vs Deep.** `session.clean_room()` is true unless Deep mode is on (`deep_mode`, or `--deep` for one
-   CLI run). Clean room never looks inside the original: only the tools in `engine/src/clean_room.rs` run, so a new
+4. **Deep by default for new installations.** Fresh settings enable Deep mode; existing saved modes keep
+   their meaning. `--deep` and `--clean-room` override one CLI run without saving. Explicit Clean room never
+   looks inside the original: only the tools in `engine/src/clean_room.rs` run, so a new
    tool is Deep-only until it's listed there, and it may be listed only if it touches no target or watches from
-   outside, as a visitor or user would. Deep mode uses every tool; built-in engines must work fully without Ghidra,
+   outside, as a visitor or user would. Deep mode offers every registered tool; built-in engines work without Ghidra,
    which only adds. Evidence records the engine and the flag.
 5. **Effects are honest.** Declare every side effect. `EXECUTES_FOREIGN_CODE` and `MUTATES_DEVICE` trigger consent.
 6. **Never break wasm** for L0–L2 (`cargo xtask wasm`).
@@ -82,23 +85,24 @@ Layering is enforced by `cargo xtask layers`. Register new crates in `xtask/src/
 These apply to every change by every agent and contributor, whether or not anyone mentions them.
 
 ### Roles and ownership
-- `docs/ROADMAP.md` is the plan: each item has an id (`R<milestone>.<n>`), an **owner**, a status and pending
+- `docs/ROADMAP.md` coordinates shared work: each item has an id (`R<milestone>.<n>`), an **owner**, a status and pending
   changes (`- [ ]` lines). Owners are roles, never people's names: **maintainers** (the project's maintainers
   steer it; agents may take its unclaimed pending changes, but anything marked **decision** waits for a
   maintainer) or **open** (anyone may take it).
-- **Claim before you start:** put `— claimed: <name>, branch <branch>` on the pending change and push your branch
-  early (or open a draft PR) so others see it. Never take a change someone else has claimed.
-- Work in the order the roadmap's "Order and dependencies" table gives; an item starts only when its
-  dependencies are done.
+- **Coordinate before overlapping work:** record `— claimed: <name>, branch <branch>` on a shared pending
+  change. Don't replace another contributor's work. Publishing a branch is not a prerequisite for local progress.
+- Check actual dependencies before starting; roadmap ordering guides unassigned backlog work, while an
+  explicit user task takes priority and may establish a new pending change.
 - A person's explicit instruction for a task overrides these rules for that task only; otherwise they apply to
   every change, without being asked.
 
 ### Before you write code
-- Pick work from `docs/ROADMAP.md` only. Don't start an item that is claimed, `blocked`, or waiting on a
-  **decision**, and don't start one whose dependencies aren't done.
-- Claim the pending change first (name + branch, in its own small commit), so no two agents do the same work.
+- Execute the user's concrete task directly. Use `docs/ROADMAP.md` to find related work and record new gaps;
+  a missing entry is not a reason to stop. When choosing work independently, avoid claimed or blocked items
+  and unresolved maintainer decisions.
+- Record ownership before editing shared work; a separate claim commit or remote push is optional.
 - Read the code you'll touch and check STATUS.md and the roadmap for gaps it depends on. If you find new gaps or
-  dependencies, add them to the roadmap rather than widening your change.
+  dependencies, record them and handle those necessary to complete the authorized task.
 
 ### Git workflow
 - Never commit to `main`. Branch from an up-to-date `main` with a standard prefix, then the roadmap id if

@@ -203,7 +203,12 @@ pub fn truncate_json(v: &Value, budget: usize) -> String {
     while cut > 0 && !s.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}… [truncated: {} of {} bytes shown; page with offset/limit or fetch the evidence by id]", s.get(..cut).unwrap_or_default(), cut, s.len())
+    format!(
+        "{}… [truncated: {} of {} bytes shown; page with offset/limit or use core_evidence_browse by evidence id]",
+        s.get(..cut).unwrap_or_default(),
+        cut,
+        s.len()
+    )
 }
 
 /// What the model sees for a tool's output: evidence summary + id + (bounded) result.
@@ -220,8 +225,9 @@ pub fn compact(out: &ToolOutput) -> (String, String, Option<String>) {
                     o.insert("result_preview".into(), json!(truncate_json(&ev.result, RESULT_BUDGET.saturating_sub(summary_len).max(512))));
                     o.insert(
                         "note".into(),
-                        json!("Result is large: this is a preview. Page with offset/limit, or get the full record with core_evidence_show {evidence_id}."),
+                        json!("Result is large: this is a preview. Use core_evidence_browse with the source below and show.kind=path; choose a JSON pointer relative to result (for example /items/0/pseudo_code). Follow result.coverage.next_offset until it is null. Text offsets count UTF-16 units; limit counts blocks of 64 units. Narrow the path if a row is too large."),
                     );
+                    o.insert("browse_source".into(), json!({"kind": "saved", "evidence_id": ev.id}));
                 }
             }
             let summary = if ev.summary.is_empty() { ev.operation.clone() } else { ev.summary.clone() };
@@ -249,6 +255,8 @@ pub struct ModelSlot {
     /// Local models cost nothing.
     pub local: bool,
     pub effort: Option<Effort>,
+    /// Most successful loop steps per user message; zero is unlimited. Saved backend settings
+    /// are normalized first so a legacy `max_turns = 0` does not become unlimited.
     pub max_turns: u32,
     /// The backend's conversation budget; zero uses the local/cloud default.
     pub context_tokens: u64,
@@ -335,11 +343,16 @@ impl AgentLoop {
         let _ = self.events.send(e);
     }
 
-    fn tool_defs(&self) -> Vec<ToolDef> {
-        let mut tools = self.host.tools(&self.enabled);
+    fn available_tools(&self, enabled: &BTreeSet<Toolset>) -> Vec<ToolDef> {
+        let mut tools = self.host.tools(enabled);
         if self.cfg.lean_for_local && self.chain.get(self.current).is_some_and(|s| s.local) {
             tools = lean_for_local(tools, self.host.as_ref());
         }
+        tools
+    }
+
+    fn tool_defs(&self) -> Vec<ToolDef> {
+        let mut tools = self.available_tools(&self.enabled);
         tools.push(ToolDef {
             name: "list_toolsets".into(),
             description: "List the groups of tools (toolsets), which are enabled, and what each covers.".into(),
@@ -347,8 +360,8 @@ impl AgentLoop {
         });
         tools.push(ToolDef {
             name: "enable_toolset".into(),
-            description: "Enable a toolset so its tools become available from the next step on. Use list_toolsets to see the ids.".into(),
-            schema: json!({"type": "object", "properties": {"toolset": {"type": "string", "enum": self.host.toolsets().iter().map(|t| t.id()).collect::<Vec<_>>()}}, "required": ["toolset"]}),
+            description: "Enable a toolset, or all toolsets, so its tools become available from the next step on. Use list_toolsets to see the ids.".into(),
+            schema: json!({"type": "object", "properties": {"toolset": {"type": "string", "enum": std::iter::once("all").chain(self.host.toolsets().iter().map(|t| t.id())).collect::<Vec<_>>()}}, "required": ["toolset"]}),
         });
         crate::anthropic::sorted(tools)
     }
@@ -378,7 +391,6 @@ impl AgentLoop {
         }
         let configured = self.chain.get(self.current).and_then(|s| s.effort);
         let effort = prompt::choose_effort(configured);
-        let max_turns = self.chain.get(self.current).map(|s| s.max_turns).unwrap_or(DEFAULT_MAX_TURNS).max(1);
         let mut msg_usage = Usage::default();
         let mut msg_cost: Option<f64> = Some(0.0);
         let mut turns = 0u32;
@@ -388,18 +400,10 @@ impl AgentLoop {
                 self.emit(AgentEvent::Status { text: "Stopped.".into() });
                 break;
             }
-            if turns >= max_turns {
-                self.emit(AgentEvent::Error {
-                    message: format!("Stopped after {max_turns} steps without a final answer."),
-                    remediation: Some("Ask it to continue, or narrow the question.".into()),
-                    log: None,
-                });
-                break;
-            }
-            turns += 1;
             let tools = self.tool_defs();
             let system = self.system.clone().unwrap_or_default();
-            let Some(result) = self.one_turn(&system, &tools, effort, &mut msg_usage, &mut msg_cost) else { break };
+            let Some(result) = self.one_turn(&system, &tools, effort, turns, &mut msg_usage, &mut msg_cost) else { break };
+            turns = turns.saturating_add(1);
             self.last_input = result.usage.input_tokens + result.usage.cache_read_tokens + result.usage.cache_write_tokens;
             self.last_history_estimate = context::estimate_tokens(&self.history).max(1);
             let (slot_name, local, model_id) = match self.chain.get(self.current) {
@@ -616,12 +620,27 @@ impl AgentLoop {
         system: &str,
         tools: &[ToolDef],
         effort: Effort,
+        completed_turns: u32,
         msg_usage: &mut Usage,
         msg_cost: &mut Option<f64>,
     ) -> Option<crate::model::TurnResult> {
         // Chain positions already fitted to a window their server reported: each is asked once more.
         let mut refitted = BTreeSet::new();
         loop {
+            if self.stop.is_stopped() {
+                self.emit(AgentEvent::Status { text: "Stopped.".into() });
+                return None;
+            }
+            // A fallback's configured limit applies immediately, before its first request.
+            let max_turns = self.chain.get(self.current)?.max_turns;
+            if max_turns != 0 && completed_turns >= max_turns {
+                self.emit(AgentEvent::Error {
+                    message: format!("Stopped after {completed_turns} steps without a final answer (this backend's limit is {max_turns})."),
+                    remediation: Some("Ask it to continue, increase this backend's max_turns, or set unlimited_turns = true in its settings.".into()),
+                    log: None,
+                });
+                return None;
+            }
             // A fallback can have a smaller window than the backend that just failed.
             if let Some((usage, cost)) = self.fit_context(system, tools) {
                 msg_usage.add(usage);
@@ -720,24 +739,24 @@ impl AgentLoop {
                     .host
                     .toolsets()
                     .iter()
-                    .map(|t| json!({"id": t.id(), "title": t.title(), "enabled": self.enabled.contains(t), "tools": self.host.tools(&BTreeSet::from([*t])).len()}))
+                    .map(|t| json!({"id": t.id(), "title": t.title(), "enabled": self.enabled.contains(t), "tools": self.available_tools(&BTreeSet::from([*t])).len()}))
                     .collect();
                 let text = json!({"toolsets": list}).to_string();
                 return (text, true, "Listed toolsets".into(), None);
             }
             "enable_toolset" => {
                 let id = input.get("toolset").and_then(Value::as_str).unwrap_or_default();
-                return match self.host.toolsets().into_iter().find(|t| t.id() == id) {
-                    Some(t) => {
-                        self.enabled.insert(t);
-                        let n = self.host.tools(&BTreeSet::from([t])).len();
-                        (json!({"enabled": id, "tools_added": n}).to_string(), true, format!("Enabled {}", t.title()), None)
-                    }
-                    None => {
-                        let e = ToolError::invalid(format!("No toolset {id:?}")).with_remediation("Call list_toolsets for the ids.");
-                        (error_text(&e), false, e.message, None)
-                    }
-                };
+                let sets = self.host.toolsets();
+                let added = if id == "all" { sets } else { sets.into_iter().filter(|t| t.id() == id).collect() };
+                if added.is_empty() && id != "all" {
+                    let e = ToolError::invalid(format!("No toolset {id:?}")).with_remediation("Call list_toolsets for the ids.");
+                    return (error_text(&e), false, e.message, None);
+                }
+                let before: BTreeSet<String> = self.available_tools(&self.enabled).into_iter().map(|t| t.name).collect();
+                self.enabled.extend(added);
+                let after: BTreeSet<String> = self.available_tools(&self.enabled).into_iter().map(|t| t.name).collect();
+                let n = after.difference(&before).count();
+                return (json!({"enabled": id, "tools_added": n, "visible_tools": after.len()}).to_string(), true, format!("Enabled {id}"), None);
             }
             _ => {}
         }
@@ -746,12 +765,9 @@ impl AgentLoop {
                 let e = ToolError::invalid(format!("No tool named {name}"));
                 return (error_text(&e), false, e.message, None);
             }
-            Some(t) if !self.enabled.contains(&t) => {
-                let e = ToolError::invalid(format!("{name} is in the {} toolset, which isn't enabled.", t.id()))
-                    .with_remediation(format!("Call enable_toolset with toolset={} first.", t.id()));
-                return (error_text(&e), false, e.message, None);
+            Some(t) => {
+                self.enabled.insert(t);
             }
-            Some(_) => {}
         }
         let cancel = self.cancel.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let mut r = self.host.call(name, input.clone(), false, cancel.clone());
@@ -1103,6 +1119,9 @@ pub(crate) mod tests {
             if enabled.contains(&Toolset::Runtime) {
                 v.push(ToolDef { name: "danger".into(), description: "d".into(), schema: json!({"type":"object"}) });
             }
+            if enabled.contains(&Toolset::Custom("test_extension")) {
+                v.push(ToolDef { name: "extra".into(), description: "d".into(), schema: json!({"type":"object"}) });
+            }
             v
         }
         fn toolset_of(&self, id: &str) -> Option<Toolset> {
@@ -1110,8 +1129,12 @@ pub(crate) mod tests {
                 "look" => Some(Toolset::Core),
                 "build_command_run" => Some(Toolset::Core),
                 "danger" => Some(Toolset::Runtime),
+                "extra" => Some(Toolset::Custom("test_extension")),
                 _ => None,
             }
+        }
+        fn toolsets(&self) -> Vec<Toolset> {
+            vec![Toolset::Core, Toolset::Runtime, Toolset::Custom("test_extension")]
         }
         fn call(&self, id: &str, input: Value, consent: bool, _c: CancelToken) -> Result<ToolOutput, ToolError> {
             self.calls.lock().unwrap().push((id.to_string(), consent));
@@ -1188,18 +1211,19 @@ pub(crate) mod tests {
         let events = drain_until_done(&mut c, |e, c| {
             if let AgentEvent::ConsentNeeded { call_id, .. } = e {
                 asked += 1;
-                c.answer_consent(call_id, call_id == "e");
+                c.answer_consent(call_id, call_id == "a" || call_id == "e");
             }
         });
-        assert_eq!(asked, 2);
+        assert_eq!(asked, 3);
         let seen = seen.lock().unwrap();
-        // turn 1: danger not enabled → error, no consent asked
+        // turn 1: the hidden tool enables its group, but still needs consent.
         let r1 = seen[1].last().unwrap();
-        assert!(matches!(&r1.blocks[0], Block::ToolResult { is_error: true, content, .. } if content.contains("enable_toolset")));
+        assert!(matches!(&r1.blocks[0], Block::ToolResult { is_error: false, content, .. } if content.contains("danger")));
         // turn 2: three results in ONE user message
         let r2 = seen[2].last().unwrap();
         assert_eq!(r2.role, Speaker::User);
         assert_eq!(r2.blocks.len(), 3);
+        assert!(matches!(&r2.blocks[0], Block::ToolResult { is_error: false, content, .. } if content.contains("\"tools_added\":0")));
         assert!(matches!(&r2.blocks[2], Block::ToolResult { is_error: true, content, .. } if content.contains("INVALID_JSON")));
         // turn 3 allowed, turn 4 declined
         assert!(matches!(&seen[3].last().unwrap().blocks[0], Block::ToolResult { is_error: false, .. }));
@@ -1216,6 +1240,186 @@ pub(crate) mod tests {
         assert!(matches!(events.last(), Some(AgentEvent::TurnDone { cost_usd: Some(_), .. })));
     }
 
+    #[test]
+    fn all_toolsets_include_plugins_and_count_only_new_visible_tools() {
+        struct Recorder {
+            script: Scripted,
+            tools: Arc<Mutex<Vec<Vec<ToolDef>>>>,
+        }
+        impl ChatModel for Recorder {
+            fn turn(&mut self, req: &TurnRequest<'_>, on: &mut dyn FnMut(Delta), stop: &Stop) -> Result<TurnResult, ToolError> {
+                self.tools.lock().unwrap().push(req.tools.to_vec());
+                self.script.turn(req, on, stop)
+            }
+            fn model(&self) -> String {
+                self.script.model()
+            }
+        }
+        for lean in [false, true] {
+            let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let tools = Arc::new(Mutex::new(Vec::new()));
+            let script = Scripted {
+                turns: VecDeque::from([
+                    turn(
+                        vec![
+                            Block::ToolUse { id: "list".into(), name: "list_toolsets".into(), input: json!({}) },
+                            Block::ToolUse { id: "all".into(), name: "enable_toolset".into(), input: json!({"toolset": "all"}) },
+                            Block::ToolUse { id: "again".into(), name: "enable_toolset".into(), input: json!({"toolset": "all"}) },
+                            Block::ToolUse { id: "unknown".into(), name: "not_a_tool".into(), input: json!({}) },
+                            Block::ToolUse { id: "extra".into(), name: "extra".into(), input: json!({}) },
+                        ],
+                        StopReason::ToolUse,
+                    ),
+                    turn(vec![Block::Text { text: "done".into() }], StopReason::EndTurn),
+                ]),
+                seen: seen.clone(),
+            };
+            let model = Recorder { script, tools: tools.clone() };
+            let slot = ModelSlot { name: "Local".into(), model: Box::new(model), local: true, effort: None, max_turns: 5, context_tokens: 0 };
+            let mut c = ApiConversation::start(host.clone(), vec![slot], LoopConfig { lean_for_local: lean, ..Default::default() }).unwrap();
+            c.send("Use the available tools");
+            let events = drain_until_done(&mut c, |_, _| {});
+            assert!(!events.iter().any(|e| matches!(e, AgentEvent::ConsentNeeded { .. } | AgentEvent::Error { .. })));
+            let seen = seen.lock().unwrap();
+            let results = &seen[1].last().unwrap().blocks;
+            let result = |i: usize| match &results[i] {
+                Block::ToolResult { content, .. } => serde_json::from_str::<Value>(content).unwrap(),
+                _ => panic!("expected result"),
+            };
+            assert_eq!(result(0)["toolsets"][0]["tools"], if lean { 0 } else { 1 });
+            assert_eq!(result(1)["tools_added"], 2, "runtime and plugin only");
+            assert_eq!(result(1)["visible_tools"], if lean { 2 } else { 3 });
+            assert_eq!(result(2)["tools_added"], 0, "enabling twice is idempotent");
+            assert!(matches!(&results[3], Block::ToolResult { is_error: true, content, .. } if content.contains("No tool named")));
+            assert!(host.calls.lock().unwrap().contains(&("extra".into(), false)));
+            let tools = tools.lock().unwrap();
+            let meta = tools[0].iter().find(|t| t.name == "enable_toolset").unwrap();
+            let ids = meta.schema["properties"]["toolset"]["enum"].as_array().unwrap();
+            assert!(ids.contains(&json!("all")) && ids.contains(&json!("test_extension")));
+            assert!(!tools[0].iter().any(|t| t.name == "extra"));
+            assert!(tools[1].iter().any(|t| t.name == "extra"));
+            assert_eq!(tools[1].iter().any(|t| t.name == "look"), !lean, "local filtering stays in force");
+        }
+    }
+
+    #[test]
+    fn automatically_enabled_tools_still_obey_the_host_policy() {
+        for clean in [true, false] {
+            let mut session = craft_anything_engine::testing::session();
+            session.settings.deep_mode = !clean;
+            let engine = Arc::new(Engine::new(session));
+            let host: Arc<dyn ToolHost> = if clean { Arc::new(EngineHost(engine)) } else { Arc::new(ReadOnlyHost(EngineHost(engine))) };
+            let tool = if clean { "native_cursor_show" } else { "runtime_walkthrough_record" };
+            assert!(host.toolset_of(tool).is_some());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let script = Scripted {
+                turns: VecDeque::from([
+                    turn(vec![Block::ToolUse { id: "call".into(), name: tool.into(), input: json!({}) }], StopReason::ToolUse),
+                    turn(vec![Block::Text { text: "done".into() }], StopReason::EndTurn),
+                ]),
+                seen: seen.clone(),
+            };
+            let slot = ModelSlot { name: "Fake".into(), model: Box::new(script), local: false, effort: None, max_turns: 5, context_tokens: 0 };
+            let mut c = ApiConversation::start(host, vec![slot], LoopConfig::default()).unwrap();
+            c.send("Inspect it");
+            let events = drain_until_done(&mut c, |_, _| {});
+            assert!(!events.iter().any(|e| matches!(e, AgentEvent::ConsentNeeded { .. })));
+            let seen = seen.lock().unwrap();
+            let result = &seen[1].last().unwrap().blocks[0];
+            assert!(
+                matches!(result, Block::ToolResult { is_error: true, content, .. } if content.contains(if clean { "clean_room" } else { "no_permission" })),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_turn_limits_stop_and_unlimited_turns_continue() {
+        for max_turns in [2, 0] {
+            let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut turns = VecDeque::from_iter((0..DEFAULT_MAX_TURNS + 1).map(|_| turn(vec![], StopReason::PauseTurn)));
+            turns.push_back(turn(vec![Block::Text { text: "done".into() }], StopReason::EndTurn));
+            let script = Scripted { turns, seen: seen.clone() };
+            let slot = ModelSlot { name: "Fake".into(), model: Box::new(script), local: false, effort: None, max_turns, context_tokens: 0 };
+            let mut c = ApiConversation::start(host, vec![slot], LoopConfig::default()).unwrap();
+            c.send("Continue investigating");
+            let events = drain_until_done(&mut c, |_, _| {});
+            if max_turns == 0 {
+                assert_eq!(seen.lock().unwrap().len(), DEFAULT_MAX_TURNS as usize + 2);
+                assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "done")));
+                assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+            } else {
+                assert_eq!(seen.lock().unwrap().len(), max_turns as usize);
+                assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("after 2 steps"))));
+            }
+        }
+    }
+
+    #[test]
+    fn unlimited_turns_still_cancel_while_a_model_is_working() {
+        struct Waiting {
+            turns: u32,
+        }
+        impl ChatModel for Waiting {
+            fn turn(&mut self, _: &TurnRequest<'_>, on: &mut dyn FnMut(Delta), stop: &Stop) -> Result<TurnResult, ToolError> {
+                self.turns += 1;
+                if self.turns <= DEFAULT_MAX_TURNS + 1 {
+                    return turn(vec![], StopReason::PauseTurn);
+                }
+                on(Delta::Text("waiting".into()));
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !stop.is_stopped() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if stop.is_stopped() { Err(ToolError::cancelled()) } else { Err(ToolError::internal("test did not cancel")) }
+            }
+            fn model(&self) -> String {
+                "waiting".into()
+            }
+        }
+        let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+        let slot = ModelSlot { name: "Waiting".into(), model: Box::new(Waiting { turns: 0 }), local: true, effort: None, max_turns: 0, context_tokens: 0 };
+        let mut c = ApiConversation::start(host, vec![slot], LoopConfig::default()).unwrap();
+        c.send("Continue investigating");
+        let events = drain_until_done(&mut c, |event, c| {
+            if matches!(event, AgentEvent::TextDelta { text } if text == "waiting") {
+                c.stop();
+            }
+        });
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "waiting")), "continued past the old default");
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Status { text } if text == "Stopped.")));
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
+    }
+
+    #[test]
+    fn fallback_obeys_its_own_limit_before_the_next_request() {
+        for (primary_limit, fallback_limit, expected_calls, finishes) in [(0, 1, 0, false), (10, 2, 1, false), (10, 0, 3, true)] {
+            let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+            let first = Scripted { turns: VecDeque::from([turn(vec![], StopReason::PauseTurn), Err(ToolError::unavailable("offline"))]), seen: Arc::default() };
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let second = Scripted {
+                turns: VecDeque::from([
+                    turn(vec![], StopReason::PauseTurn),
+                    turn(vec![], StopReason::PauseTurn),
+                    turn(vec![Block::Text { text: "done".into() }], StopReason::EndTurn),
+                ]),
+                seen: seen.clone(),
+            };
+            let chain = vec![
+                ModelSlot { name: "First".into(), model: Box::new(first), local: true, effort: None, max_turns: primary_limit, context_tokens: 0 },
+                ModelSlot { name: "Fallback".into(), model: Box::new(second), local: true, effort: None, max_turns: fallback_limit, context_tokens: 0 },
+            ];
+            let mut c = ApiConversation::start(host, chain, LoopConfig::default()).unwrap();
+            c.send("Continue investigating");
+            let events = drain_until_done(&mut c, |_, _| {});
+            assert_eq!(seen.lock().unwrap().len(), expected_calls, "fallback limit {fallback_limit}: {events:?}");
+            assert_eq!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "done")), finishes);
+            assert_eq!(events.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("steps"))), !finishes);
+        }
+    }
+
     /// #399: a model that never gets its code to compile kept going for 400 steps and 9.4M tokens.
     /// A step stops after [`MAX_FAILED_BUILDS`] failed build commands in a row, says why, and keeps
     /// what was done; a build that succeeds starts the count again.
@@ -1227,7 +1431,8 @@ pub(crate) mod tests {
         let run = |turns: Vec<Result<TurnResult, ToolError>>| {
             let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
             let script = Scripted { turns: VecDeque::from(turns), seen: Arc::default() };
-            let slot = ModelSlot { name: "Fake".into(), model: Box::new(script), local: false, effort: None, max_turns: 400, context_tokens: 0 };
+            // Removing the turn cap does not remove the no-progress guard.
+            let slot = ModelSlot { name: "Fake".into(), model: Box::new(script), local: false, effort: None, max_turns: 0, context_tokens: 0 };
             let mut c = ApiConversation::start(host, vec![slot], LoopConfig { beginner: true, ..LoopConfig::default() }).unwrap();
             c.send("build it");
             drain_until_done(&mut c, |_, _| {})
@@ -1769,9 +1974,47 @@ pub(crate) mod tests {
         let (text, _, _) = compact(&ToolOutput::evidence(big));
         assert!(text.len() < RESULT_BUDGET + 2048);
         assert!(text.contains("result_preview"));
+        assert!(text.contains("core_evidence_browse") && text.contains("browse_source") && !text.contains("core_evidence_show"));
         let (text, _, id) = compact(&ToolOutput::Value(json!({"k": "v"})));
         assert!(text.contains("\"k\""));
         assert!(id.is_none());
         assert!(truncate_json(&json!("é".repeat(50_000)), 1000).len() < 1100);
+    }
+
+    #[test]
+    fn compacted_evidence_pages_reach_the_full_nested_text() {
+        use craft_anything_evidence::{Environment, EvidenceBuilder, Subject};
+        let original = format!("{}END_OF_FUNCTION", "\"\\\n🔍".repeat(6000));
+        let evidence = EvidenceBuilder::new("native_functions_decompile", Subject::default(), Environment::builtin(false))
+            .result(json!({"items": [{"pseudo_code": original}]}))
+            .target_content(true)
+            .summary("A long function")
+            .build()
+            .unwrap();
+        let id = evidence.id.clone();
+        let preview = compact(&ToolOutput::evidence(evidence.clone())).0;
+        assert!(!preview.contains("END_OF_FUNCTION"), "the tail is beyond the preview");
+        let mut session = craft_anything_engine::testing::session();
+        session.record(evidence).unwrap();
+        let engine = Engine::new(session);
+        let mut offset = 0;
+        let mut assembled = String::new();
+        for _ in 0..1000 {
+            let page = engine
+                .call(
+                    "core_evidence_browse",
+                    json!({"source": {"kind": "saved", "evidence_id": id}, "show": {"kind": "path", "path": "/items/0/pseudo_code", "offset": offset, "limit": 64}}),
+                    CallOptions::new(Caller::Agent),
+                )
+                .unwrap();
+            let compacted = compact(&page).0;
+            let value: Value = serde_json::from_str(&compacted).expect("each whole page fits the model's result budget");
+            assert!(value.get("result_preview").is_none(), "a page must not be truncated again");
+            assembled.push_str(value["result"]["shown"]["text"].as_str().unwrap());
+            let Some(next) = value["result"]["coverage"]["next_offset"].as_u64() else { break };
+            assert!(next > offset, "the next page advances");
+            offset = next;
+        }
+        assert_eq!(assembled, original);
     }
 }

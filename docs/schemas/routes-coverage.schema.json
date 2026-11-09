@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RouteCoverage",
+  "type": "object",
+  "properties": {
+    "attempted": {
+      "type": "integer",
+      "format": "uint",
+      "default": 0,
+      "minimum": 0
+    },
+    "boundaries": {
+      "description": "Named reasons that traversal stopped or omitted work, including count/depth, resource\nbounds, failed captures and cancellation. An empty list means the discovered queue ended.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "captured": {
+      "type": "integer",
+      "format": "uint",
+      "default": 0,
+      "minimum": 0
+    },
+    "discovered": {
+      "type": "integer",
+      "format": "uint",
+      "default": 0,
+      "minimum": 0
+    },
+    "failed": {
+      "type": "integer",
+      "format": "uint",
+      "default": 0,
+      "minimum": 0
+    },
+    "max_depth": {
+      "description": "None means no depth budget; the start page's links have depth one.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": 2,
+      "minimum": 0
+    },
+    "max_pages": {
+      "description": "Budget for successful captures, not attempts. None removes it; Some(0) captures no other pages.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": 4,
+      "minimum": 0
+    },
+    "redirected_outside_origin": {
+      "type": "integer",
+      "format": "uint",
+      "default": 0,
+      "minimum": 0
+    },
+    "resource_limits": {
+      "$ref": "#/$defs/RouteResourceLimits",
+      "default": {
+        "capture_json_bytes": 8388608,
+        "frontier_routes": 256,
+        "links_per_page": 16384,
+        "prompt_routes": 32,
+        "retained_routes": 256,
+        "route_manifest_bytes": 4194304,
+        "url_bytes": 2048,
+        "visited_routes": 4096
+      }
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "default": 1,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "RouteResourceLimits": {
+      "type": "object",
+      "properties": {
+        "capture_json_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 8388608,
+          "minimum": 0
+        },
+        "frontier_routes": {
+          "type": "integer",
+          "format": "uint",
+          "default": 256,
+          "minimum": 0
+        },
+        "links_per_page": {
+          "type": "integer",
+          "format": "uint",
+          "default": 16384,
+          "minimum": 0
+        },
+        "prompt_routes": {
+          "type": "integer",
+          "format": "uint",
+          "default": 32,
+          "minimum": 0
+        },
+        "retained_routes": {
+          "type": "integer",
+          "format": "uint",
+          "default": 256,
+          "minimum": 0
+        },
+        "route_manifest_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 4194304,
+          "minimum": 0
+        },
+        "url_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "default": 2048,
+          "minimum": 0
+        },
+        "visited_routes": {
+          "type": "integer",
+          "format": "uint",
+          "default": 4096,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

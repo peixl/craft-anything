@@ -2,8 +2,11 @@
 //! screenshots with the original's.
 
 use super::*;
+use craft_anything_engine::workspace::route_coverage::{RouteCoverage, RouteResourceLimits};
 use craft_anything_engine::workspace::{Claim, PageLikeness};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::io::Read;
 
 pub struct WebsiteKind;
 
@@ -11,9 +14,6 @@ impl WebsiteKind {
     pub const ID: &'static str = "website";
 }
 
-/// Other pages of the site studied and checked besides the one the person gave, at most (the
-/// setting `build.max_pages` chooses how many up to this).
-pub const MAX_ROUTES: usize = 12;
 /// Where the other pages are listed in the capture folder.
 pub const ROUTES_FILE: &str = "routes.json";
 /// Where the start page's opened menus, pop-ups and tabs are kept in the capture folder, at the
@@ -68,37 +68,61 @@ pub struct Route {
     pub url: String,
 }
 
+fn origin_and_path(url: &str) -> Option<(String, String)> {
+    let url = url.split('#').next()?;
+    let uri: ureq::http::Uri = url.parse().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let host = authority.host().to_ascii_lowercase();
+    let port = authority.port_u16().filter(|p| !((scheme == "http" && *p == 80) || (scheme == "https" && *p == 443)));
+    let origin = format!("{scheme}://{host}{}", port.map(|p| format!(":{p}")).unwrap_or_default());
+    Some((origin, uri.path().to_string()))
+}
+
+pub(crate) fn same_origin(left: &str, right: &str) -> bool {
+    matches!((origin_and_path(left), origin_and_path(right)), (Some((a, _)), Some((b, _))) if a == b)
+}
+
+fn route_from_link(link: &Value, start: &str) -> Option<Route> {
+    let (origin, start_path) = origin_and_path(start)?;
+    let (other, path) = origin_and_path(link.get("href")?.as_str()?)?;
+    let last = path.rsplit('/').next().unwrap_or_default();
+    let file = last.contains('.') && !last.ends_with(".html") && !last.ends_with(".htm");
+    if origin != other || file || path.trim_end_matches('/') == start_path.trim_end_matches('/') {
+        return None;
+    }
+    let slug: String = path.trim_matches('/').chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
+    let slug = slug.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+    if slug.is_empty() {
+        return None;
+    }
+    let slug = if slug.len() > 96 {
+        format!("{}-{}", slug.chars().take(80).collect::<String>(), craft_anything_evidence::sha256_hex(path.as_bytes()).get(..12).unwrap_or_default())
+    } else {
+        slug
+    };
+    Some(Route { url: format!("{origin}{path}"), path, slug })
+}
+
 /// Up to `max` other pages of the same site, from the links a capture found (`capture.json`'s
 /// `links`): same scheme and host, a page rather than a file, each path once, not the start page.
 pub fn pick_routes(capture: &Value, start: &str, max: usize) -> Vec<Route> {
-    let origin_and_path = |u: &str| -> Option<(String, String)> {
-        let (scheme, rest) = u.split_once("://")?;
-        if scheme != "http" && scheme != "https" {
-            return None;
-        }
-        let rest = rest.split(['#', '?']).next().unwrap_or_default();
-        let (host, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}"))).unwrap_or((rest, "/".into()));
-        Some((format!("{scheme}://{}", host.to_ascii_lowercase()), path))
-    };
-    let Some((origin, start_path)) = origin_and_path(start) else { return Vec::new() };
     let norm = |p: &str| p.trim_end_matches('/').to_string();
     let mut out: Vec<Route> = Vec::new();
     for link in capture.get("links").and_then(Value::as_array).into_iter().flatten() {
         if out.len() >= max {
             break;
         }
-        let Some((o, path)) = link.get("href").and_then(Value::as_str).and_then(origin_and_path) else { continue };
-        let last = path.rsplit('/').next().unwrap_or_default();
-        let file = last.contains('.') && !last.ends_with(".html") && !last.ends_with(".htm");
-        if o != origin || file || norm(&path) == norm(&start_path) || out.iter().any(|r| norm(&r.path) == norm(&path)) {
-            continue;
+        let Some(route) = route_from_link(link, start) else { continue };
+        if !out.iter().any(|r| norm(&r.path) == norm(&route.path) || r.slug == route.slug) {
+            out.push(route);
         }
-        let slug: String = path.trim_matches('/').chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
-        let slug = slug.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
-        if slug.is_empty() || out.iter().any(|r| r.slug == slug) {
-            continue;
-        }
-        out.push(Route { url: format!("{origin}{path}"), path, slug });
     }
     out
 }
@@ -109,7 +133,7 @@ pub fn pick_deeper_routes(captures: &[Value], start: &str, have: &[Route], max: 
     let norm = |p: &str| p.trim_end_matches('/').to_string();
     let mut out: Vec<Route> = Vec::new();
     for c in captures {
-        for r in pick_routes(c, start, MAX_ROUTES) {
+        for r in pick_routes(c, start, max.saturating_add(have.len())) {
             if out.len() >= max {
                 return out;
             }
@@ -124,7 +148,202 @@ pub fn pick_deeper_routes(captures: &[Value], start: &str, have: &[Route], max: 
 
 /// The other pages captured for a project (none when only the start page was).
 pub fn routes(ws: &Workspace) -> Vec<Route> {
-    std::fs::read(ws.capture_dir().join(ROUTES_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    route_list(ws).0
+}
+
+/// Read a capture without trusting a file length that might change during the read.
+pub(crate) fn read_bounded_json(path: &Path, limit: u64) -> Result<Value, ToolError> {
+    let file = std::fs::File::open(path).map_err(|e| ToolError::io(path.display(), e))?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| ToolError::io(path.display(), e))?;
+    if bytes.len() as u64 > limit {
+        return Err(ToolError::new(ErrorCode::OverLimit, "The capture JSON exceeds its read budget."));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| ToolError::invalid(format!("Couldn't read capture JSON: {e}")))
+}
+
+fn route_list(ws: &Workspace) -> (Vec<Route>, Option<String>) {
+    let path = ws.capture_dir().join(ROUTES_FILE);
+    if !path.exists() {
+        return (Vec::new(), None);
+    }
+    let limits = RouteResourceLimits::default();
+    let parsed = read_bounded_json(&path, limits.route_manifest_bytes)
+        .and_then(|v| serde_json::from_value::<Vec<Route>>(v).map_err(|e| ToolError::invalid(e.to_string())));
+    let Ok(mut routes) = parsed else {
+        return (Vec::new(), Some("The saved route list could not be read within its bounded format.".into()));
+    };
+    let mut partial = routes.len() > limits.retained_routes;
+    routes.truncate(limits.retained_routes);
+    routes.retain(|r| {
+        let valid = r.path.len() <= limits.url_bytes
+            && r.url.len() <= limits.url_bytes
+            && r.path.starts_with('/')
+            && !r.slug.is_empty()
+            && r.slug.len() <= 128
+            && r.slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        partial |= !valid;
+        valid
+    });
+    (routes, partial.then(|| "The saved route list exceeds its count or path bounds; only the valid retained prefix was used.".into()))
+}
+
+pub(crate) fn route_coverage(ws: &Workspace) -> Option<RouteCoverage> {
+    read_bounded_json(&ws.capture_dir().join(craft_anything_engine::workspace::route_coverage::FILE), 64 * 1024)
+        .ok()
+        .and_then(|v| RouteCoverage::from_value(v).ok())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteAction {
+    Open,
+    Capture,
+}
+
+struct RouteQueue {
+    pending: VecDeque<(Route, usize)>,
+    seen: HashSet<String>,
+    slugs: HashSet<String>,
+    report: RouteCoverage,
+}
+
+impl RouteQueue {
+    fn discover(&mut self, capture: &Value, start: &str, depth: usize) {
+        let limits = &self.report.resource_limits;
+        let links = capture.get("links").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        if links.len() > limits.links_per_page {
+            self.report.boundary("links_per_page");
+        }
+        let limits = self.report.resource_limits.clone();
+        for link in links.iter().take(limits.links_per_page) {
+            if link.get("href").and_then(Value::as_str).is_some_and(|u| u.len() > limits.url_bytes) {
+                self.report.boundary("url_bytes");
+                continue;
+            }
+            let Some(mut route) = route_from_link(link, start) else { continue };
+            let key = route.url.trim_end_matches('/').to_string();
+            if self.seen.contains(&key) {
+                continue;
+            }
+            if self.report.max_depth.is_some_and(|max| depth > max) {
+                self.report.boundary("depth_limit");
+                break;
+            }
+            if self.seen.len() >= limits.visited_routes {
+                self.report.boundary("visited_routes");
+                break;
+            }
+            self.seen.insert(key);
+            self.report.discovered = self.seen.len();
+            if self.pending.len() >= limits.frontier_routes {
+                self.report.boundary("frontier_routes");
+                break;
+            }
+            if !self.slugs.insert(route.slug.clone()) {
+                route.slug = format!("{}-{}", route.slug, craft_anything_evidence::sha256_hex(route.path.as_bytes()).get(..12).unwrap_or_default());
+                if !self.slugs.insert(route.slug.clone()) {
+                    self.report.boundary("slug_collision");
+                    continue;
+                }
+            }
+            self.pending.push_back((route, depth));
+        }
+    }
+}
+
+fn save_route_capture(capture: &Path, routes: &[Route], report: &RouteCoverage) -> Result<(), ToolError> {
+    std::fs::create_dir_all(capture).map_err(|e| ToolError::io(capture.display(), e))?;
+    let save = |name: &str, value: &Value| {
+        let bytes = serde_json::to_vec_pretty(value).map_err(|e| ToolError::internal(e.to_string()))?;
+        craft_anything_engine::project::write_atomic(&capture.join(name), &bytes)
+    };
+    save(ROUTES_FILE, &json!(routes))?;
+    save(craft_anything_engine::workspace::route_coverage::FILE, &json!(report))
+}
+
+/// Breadth-first study. Navigation and capture are separate so a cross-origin redirect is
+/// rejected before any screenshot/source capture. The callback makes this path testable without a browser.
+pub(crate) fn capture_routes_with(
+    capture_directory: &Path,
+    start: &str,
+    initial: &Value,
+    settings: &craft_anything_engine::settings::BuildSettings,
+    stop: &CancelToken,
+    mut visit: impl FnMut(RouteAction, &Route) -> Result<Value, ToolError>,
+) -> Result<RouteCoverage, ToolError> {
+    let report = RouteCoverage {
+        max_pages: (!settings.unlimited_pages).then_some(settings.max_pages),
+        max_depth: (settings.max_page_depth != 0).then_some(settings.max_page_depth),
+        ..RouteCoverage::default()
+    };
+    let mut queue = RouteQueue { pending: VecDeque::new(), seen: HashSet::new(), slugs: HashSet::new(), report };
+    queue.discover(initial, start, 1);
+    let mut kept = Vec::new();
+    let outcome = loop {
+        if stop.is_cancelled() {
+            queue.report.boundary("cancelled");
+            break Err(ToolError::cancelled());
+        }
+        if !queue.pending.is_empty() && queue.report.max_pages.is_some_and(|max| kept.len() >= max) {
+            queue.report.boundary("count_limit");
+            break Ok(());
+        }
+        if !queue.pending.is_empty() && kept.len() >= queue.report.resource_limits.retained_routes {
+            queue.report.boundary("retained_routes");
+            break Ok(());
+        }
+        let Some((route, depth)) = queue.pending.pop_front() else {
+            break Ok(());
+        };
+        queue.report.attempted =
+            queue.report.attempted.checked_add(1).ok_or_else(|| ToolError::new(ErrorCode::OverLimit, "Route attempt counter overflow."))?;
+        let visited = visit(RouteAction::Open, &route).and_then(|opened| {
+            let final_url = opened.get("url").and_then(Value::as_str).ok_or_else(|| ToolError::invalid("Navigation did not report its final URL."))?;
+            if !same_origin(start, final_url) {
+                return Ok(None);
+            }
+            stop.check()?;
+            visit(RouteAction::Capture, &route).map(Some)
+        });
+        match visited {
+            Ok(Some(capture)) => {
+                let Some(captured_url) = capture.get("url").and_then(Value::as_str) else {
+                    queue.report.failed = queue.report.failed.saturating_add(1);
+                    queue.report.boundary("capture_url_missing");
+                    save_route_capture(capture_directory, &kept, &queue.report)?;
+                    continue;
+                };
+                if !same_origin(start, captured_url) {
+                    queue.report.redirected_outside_origin = queue.report.redirected_outside_origin.saturating_add(1);
+                    queue.report.boundary("capture_redirected_outside_origin");
+                    save_route_capture(capture_directory, &kept, &queue.report)?;
+                    continue;
+                }
+                kept.push(route);
+                queue.report.captured = kept.len();
+                if let Some(next) = depth.checked_add(1) {
+                    queue.discover(&capture, start, next);
+                } else {
+                    queue.report.boundary("depth_counter");
+                }
+            }
+            Ok(None) => {
+                queue.report.redirected_outside_origin = queue.report.redirected_outside_origin.saturating_add(1);
+                queue.report.boundary("redirected_outside_origin");
+            }
+            Err(e) if e.code == ErrorCode::Cancelled => {
+                queue.report.boundary("cancelled");
+                break Err(e);
+            }
+            Err(e) => {
+                queue.report.failed = queue.report.failed.saturating_add(1);
+                queue.report.boundary(if e.code == ErrorCode::OverLimit { "capture_json_bytes" } else { "capture_failed" });
+            }
+        }
+        save_route_capture(capture_directory, &kept, &queue.report)?;
+    };
+    save_route_capture(capture_directory, &kept, &queue.report)?;
+    outcome.map(|()| queue.report)
 }
 
 impl TargetKind for WebsiteKind {
@@ -193,12 +412,22 @@ impl TargetKind for WebsiteKind {
 
     fn brief_sections(&self, cx: &BriefCx) -> Vec<String> {
         let mut out = Vec::new();
-        let routes = routes(cx.ws);
+        let (routes, warning) = route_list(cx.ws);
         if !routes.is_empty() {
-            let list = routes.iter().map(|r| format!("{} (capture/routes/{}/)", r.path, r.slug)).collect::<Vec<_>>().join(", ");
+            let shown = RouteResourceLimits::default().prompt_routes;
+            let list = routes.iter().take(shown).map(|r| format!("{} (capture/routes/{}/)", short_note(&r.path, 160), r.slug)).collect::<Vec<_>>().join(", ");
             out.push(format!(
                 "The site has more pages, captured the same way: {list}. Rebuild each at the same path, with the same navigation between them; they're compared with the original too."
             ));
+            if routes.len() > shown {
+                out.push(format!("This brief lists the first {shown} of {} captured routes. Read capture/routes.json for every exact path and capture folder; the remaining routes are part of the build and checks too.", routes.len()));
+            }
+        }
+        if let Some(warning) = warning {
+            out.push(warning);
+        }
+        if let Some(coverage) = route_coverage(cx.ws) {
+            out.push(route_scope_note(&coverage));
         }
         let states = pictured_states(cx.ws);
         if !states.is_empty() {
@@ -676,7 +905,25 @@ pub fn pair_states<'a>(original: &'a Value, built: &'a Value) -> Vec<(&'a Value,
 
 /// Read a JSON file, or None.
 fn read_json(path: &Path) -> Option<Value> {
-    std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok())
+    read_bounded_json(path, RouteResourceLimits::default().capture_json_bytes).ok()
+}
+
+fn short_note(text: &str, chars: usize) -> String {
+    let mut iter = text.chars();
+    let mut shown: String = iter.by_ref().take(chars).collect();
+    if iter.next().is_some() {
+        shown.push_str("… (see the page's capture/check files)");
+    }
+    shown
+}
+
+fn route_scope_note(coverage: &RouteCoverage) -> String {
+    format!(
+        "Route-study scope: {} captured from {} attempted additional pages; boundaries: {}. The configured count/depth and resource bounds are recorded in capture/routes-coverage.json.",
+        coverage.captured,
+        coverage.attempted,
+        if coverage.boundaries.is_empty() { "none in the discovered queue".into() } else { coverage.boundaries.join(", ") }
+    )
 }
 
 /// A picture of the build against the original's, in percent: (likeness, layout, detail), then
@@ -785,7 +1032,8 @@ impl Check for WebVisualCheck {
         std::fs::create_dir_all(ws.checks_dir()).map_err(|e| ToolError::io(ws.checks_dir().display(), e))?;
         // The start page, then every other page studied: the same path on the build.
         let mut pages = vec![("start page".to_string(), String::new(), base.clone())];
-        for r in routes(ws) {
+        let (study_routes, route_warning) = route_list(ws);
+        for r in study_routes {
             let url = format!("{}{}", base.trim_end_matches('/'), r.path);
             pages.push((r.path.clone(), format!("routes/{}", r.slug), url));
         }
@@ -795,6 +1043,21 @@ impl Check for WebVisualCheck {
         let mut artifacts = Vec::new();
         let mut unknowns = Vec::new();
         let mut claims = Vec::new();
+        if let Some(warning) = route_warning {
+            unknowns.push(warning);
+        }
+        if let Some(coverage) = route_coverage(ws) {
+            notes.push(route_scope_note(&coverage));
+            let unmeasured: Vec<&str> = coverage.boundaries.iter().map(String::as_str).filter(|b| !matches!(*b, "count_limit" | "depth_limit")).collect();
+            // A finite quota that was filled still covers the chosen number of pages, even if
+            // other candidates failed or exceeded the queue. The note keeps those facts visible.
+            let quota_met = coverage.max_pages.is_some_and(|max| coverage.captured >= max);
+            if !quota_met && !unmeasured.is_empty() {
+                unknowns.push(format!("Route study was partial: {}", unmeasured.join(", ")));
+            }
+        } else if ws.capture_dir().join(craft_anything_engine::workspace::route_coverage::FILE).exists() {
+            unknowns.push("The route-study coverage record could not be read.".into());
+        }
         for (name, dir, url) in &pages {
             let (original, built) = if dir.is_empty() { (ws.capture_dir(), out.clone()) } else { (ws.capture_dir().join(dir), out.join(dir)) };
             // web_site_capture creates the page's own folder (it must not exist yet) inside one
@@ -835,7 +1098,15 @@ impl Check for WebVisualCheck {
             let page = if dir.is_empty() { "The start page".to_string() } else { name.clone() };
             let text = match (read_json(&original.join("capture.json")), read_json(&built.join("capture.json"))) {
                 (Some(o), Some(b)) => {
-                    claims.extend(page_claims(&page, &o, &b));
+                    let page_checks = page_claims(&page, &o, &b);
+                    if page_checks.len() > 64 {
+                        unknowns.push(format!("{name}: more than 64 page claims; the retained prefix does not cover them all"));
+                    }
+                    claims.extend(page_checks.into_iter().take(64).map(|mut claim| {
+                        claim.title = short_note(&claim.title, 256);
+                        claim.detail = short_note(&claim.detail, 512);
+                        claim
+                    }));
                     [text_likeness(&o, &b).map(|t| t.note()), structure_likeness(&o, &b).map(|s| s.note())]
                         .into_iter()
                         .flatten()
@@ -846,7 +1117,7 @@ impl Check for WebVisualCheck {
                 }
                 _ => String::new(),
             };
-            notes.push(if pages.len() == 1 { format!("{widths}{text}") } else { format!("{name}: {score:.0}% ({widths}{text})") });
+            notes.push(short_note(&if pages.len() == 1 { format!("{widths}{text}") } else { format!("{name}: {score:.0}% ({widths}{text})") }, 2048));
         }
         if scores.is_empty() {
             return Ok(CheckResult::new(self.id(), round, false, "The build couldn't be compared with the original."));
@@ -856,7 +1127,12 @@ impl Check for WebVisualCheck {
         }
         let failed: Vec<String> = claims.iter().filter(|c| !c.passed).map(|c| format!("{} ({})", c.title, c.detail)).collect();
         if !failed.is_empty() {
-            notes.push(format!("{} of {} claims don't hold yet: {}", failed.len(), claims.len(), failed.join("; ")));
+            notes.push(format!(
+                "{} of {} claims don't hold yet (first 32 listed): {}",
+                failed.len(),
+                claims.len(),
+                failed.iter().take(32).cloned().collect::<Vec<_>>().join("; ")
+            ));
         }
         if !unknowns.is_empty() {
             notes.push(format!("not compared, so this can't pass yet: {}", unknowns.join(", ")));
@@ -871,6 +1147,181 @@ impl Check for WebVisualCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn linked(paths: &[&str]) -> Value {
+        json!({"url": "https://site.example/", "links": paths.iter().map(|p| json!({"href": format!("https://site.example{p}")})).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn a_late_redirect_or_missing_capture_url_is_not_retained_or_traversed() {
+        let root = tempfile::tempdir().unwrap();
+        let build = craft_anything_engine::settings::BuildSettings { unlimited_pages: true, max_page_depth: 0, ..Default::default() };
+        for final_url in [Some("https://other.example/late"), None] {
+            let mut opened = Vec::new();
+            let report = capture_routes_with(root.path(), "https://site.example/", &linked(&["/start"]), &build, &CancelToken::default(), |action, route| {
+                if action == RouteAction::Open {
+                    opened.push(route.path.clone());
+                    return Ok(json!({"url": route.url}));
+                }
+                let mut capture = linked(&["/must-not-follow"]);
+                if let Some(url) = final_url {
+                    capture["url"] = json!(url);
+                } else {
+                    capture.as_object_mut().unwrap().remove("url");
+                }
+                Ok(capture)
+            })
+            .unwrap();
+            assert_eq!(opened, ["/start"]);
+            assert_eq!((report.attempted, report.captured), (1, 0));
+            let boundary = if final_url.is_some() { "capture_redirected_outside_origin" } else { "capture_url_missing" };
+            assert!(report.boundaries.iter().any(|b| b == boundary));
+            assert_eq!(report.redirected_outside_origin, usize::from(final_url.is_some()));
+            assert_eq!(report.failed, usize::from(final_url.is_none()));
+            assert_eq!(read_bounded_json(&root.path().join(ROUTES_FILE), 1024).unwrap(), json!([]));
+        }
+    }
+
+    #[test]
+    fn traversal_honors_more_than_twelve_pages_and_zero_keeps_its_old_meaning() {
+        let root = tempfile::tempdir().unwrap();
+        let initial = json!({"links": (0..24).map(|i| json!({"href": format!("https://site.example/p{i}")})).collect::<Vec<_>>()});
+        for (count, unlimited, expected) in [(18, false, 18), (0, false, 0), (0, true, 24)] {
+            let build = craft_anything_engine::settings::BuildSettings { max_pages: count, unlimited_pages: unlimited, ..Default::default() };
+            let report = capture_routes_with(root.path(), "https://site.example/", &initial, &build, &CancelToken::default(), |action, route| {
+                Ok(if action == RouteAction::Open { json!({"url": route.url}) } else { linked(&[]) })
+            })
+            .unwrap();
+            assert_eq!((report.attempted, report.captured), (expected, expected));
+            assert_eq!(report.boundaries.contains(&"count_limit".into()), expected < 24);
+        }
+    }
+
+    #[test]
+    fn finite_page_budgets_can_fill_after_failed_captures() {
+        let root = tempfile::tempdir().unwrap();
+        let build = craft_anything_engine::settings::BuildSettings { max_pages: 2, ..Default::default() };
+        let report = capture_routes_with(
+            root.path(),
+            "https://site.example/",
+            &linked(&["/broken", "/a", "/b", "/c"]),
+            &build,
+            &CancelToken::default(),
+            |action, route| {
+                if route.path == "/broken" {
+                    return Err(ToolError::invalid("fixture failure"));
+                }
+                Ok(if action == RouteAction::Open { json!({"url": route.url}) } else { linked(&[]) })
+            },
+        )
+        .unwrap();
+        assert_eq!((report.attempted, report.captured, report.failed), (3, 2, 1));
+        assert!(report.boundaries.contains(&"count_limit".into()));
+    }
+
+    #[test]
+    fn traversal_is_breadth_first_and_deduplicates_failed_links_and_cycles() {
+        let root = tempfile::tempdir().unwrap();
+        let build = craft_anything_engine::settings::BuildSettings { unlimited_pages: true, max_page_depth: 0, ..Default::default() };
+        let mut opened = Vec::new();
+        let report = capture_routes_with(
+            root.path(),
+            "https://site.example/",
+            &linked(&["/a", "/b", "/broken", "/away"]),
+            &build,
+            &CancelToken::default(),
+            |action, route| {
+                if action == RouteAction::Open {
+                    opened.push(route.path.clone());
+                    return match route.path.as_str() {
+                        "/broken" => Err(ToolError::invalid("fixture failure")),
+                        "/away" => Ok(json!({"url": "https://other.example/redirected"})),
+                        _ => Ok(json!({"url": route.url})),
+                    };
+                }
+                assert_ne!(route.path, "/away", "a foreign redirect is never captured");
+                Ok(match route.path.as_str() {
+                    "/a" => linked(&["/a", "/b", "/c", "/broken"]),
+                    "/b" => linked(&["/a", "/c", "/d", "/away"]),
+                    "/c" => linked(&["/e"]),
+                    "/e" => linked(&["/a", "/broken"]),
+                    _ => linked(&[]),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(opened, ["/a", "/b", "/broken", "/away", "/c", "/d", "/e"]);
+        assert_eq!((report.attempted, report.captured, report.failed, report.redirected_outside_origin), (7, 5, 1, 1));
+        assert!(same_origin("https://SITE.example:443/start", "https://site.example/elsewhere"));
+        assert!(!same_origin("https://site.example/", "https://site.example:444/"));
+        assert!(!same_origin("https://site.example/", "https://site.example@other.example/"));
+    }
+
+    #[test]
+    fn depth_budget_and_cancellation_keep_the_captured_subset() {
+        let root = tempfile::tempdir().unwrap();
+        let build = craft_anything_engine::settings::BuildSettings { unlimited_pages: true, max_page_depth: 2, ..Default::default() };
+        let report = capture_routes_with(root.path(), "https://site.example/", &linked(&["/a"]), &build, &CancelToken::default(), |action, route| {
+            Ok(if action == RouteAction::Open {
+                json!({"url": route.url})
+            } else if route.path == "/a" {
+                linked(&["/b"])
+            } else {
+                linked(&["/c"])
+            })
+        })
+        .unwrap();
+        assert_eq!(report.captured, 2);
+        assert!(report.boundaries.contains(&"depth_limit".into()));
+        let stop = CancelToken::default();
+        let error = capture_routes_with(root.path(), "https://site.example/", &linked(&["/a", "/b"]), &build, &stop, |action, route| {
+            if action == RouteAction::Open {
+                return Ok(json!({"url": route.url}));
+            }
+            stop.cancel();
+            Ok(linked(&[]))
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        let kept: Vec<Route> = serde_json::from_slice(&std::fs::read(root.path().join(ROUTES_FILE)).unwrap()).unwrap();
+        assert_eq!(kept.len(), 1);
+        let report =
+            RouteCoverage::from_value(read_bounded_json(&root.path().join(craft_anything_engine::workspace::route_coverage::FILE), 65536).unwrap()).unwrap();
+        assert_eq!((report.attempted, report.captured), (1, 1));
+        assert!(report.boundaries.contains(&"cancelled".into()));
+    }
+
+    #[test]
+    fn resource_boundaries_and_bounded_readers_are_explicit() {
+        let root = tempfile::tempdir().unwrap();
+        let initial = json!({"links": (0..300).map(|i| json!({"href": format!("https://site.example/p{i}")})).collect::<Vec<_>>()});
+        let build = craft_anything_engine::settings::BuildSettings { unlimited_pages: true, max_page_depth: 0, ..Default::default() };
+        let report = capture_routes_with(root.path(), "https://site.example/", &initial, &build, &CancelToken::default(), |action, route| {
+            Ok(if action == RouteAction::Open { json!({"url": route.url}) } else { linked(&[]) })
+        })
+        .unwrap();
+        assert_eq!(report.captured, report.resource_limits.retained_routes);
+        assert!(report.boundaries.contains(&"frontier_routes".into()));
+        let path = root.path().join("large.json");
+        std::fs::write(&path, " ".repeat(65)).unwrap();
+        assert_eq!(read_bounded_json(&path, 64).unwrap_err().code, ErrorCode::OverLimit);
+    }
+
+    #[test]
+    fn long_route_briefs_point_to_every_retained_path() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(root.path(), "Site", "Rebuild it", TargetRef::Website { url: "https://site.example/".into() }).unwrap();
+        let routes: Vec<Route> = (0..40).map(|i| Route { path: format!("/p{i}"), url: format!("https://site.example/p{i}"), slug: format!("p{i}") }).collect();
+        save_route_capture(&ws.capture_dir(), &routes, &RouteCoverage { captured: 40, attempted: 40, ..Default::default() }).unwrap();
+        let cx = BriefCx { ws: &ws, deep: true, ghidra: false, editor: None, assets: false, image_model: None, sees_pictures: true };
+        let brief = WebsiteKind.brief_sections(&cx).join("\n");
+        assert!(
+            brief.contains("first 32 of 40")
+                && brief.contains("capture/routes.json")
+                && brief.contains("remaining routes are part of the build and checks too")
+        );
+        assert_eq!(super::routes(&ws).len(), 40);
+    }
 
     /// #736: an empty app/ is said to be empty, so a builder that claims a build can't hide it; a
     /// folder with files, or a project folder (which always holds the workspace's own), isn't.

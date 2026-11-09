@@ -134,6 +134,12 @@ impl Client {
         self.request("ping", Value::Null, cancel, deadline)
     }
 
+    /// Close a cancelled connection without waiting for a bridge that is busy decompiling.
+    pub(crate) fn abort(&mut self) {
+        let _ = self.writer.shutdown(Shutdown::Both);
+        self.pending.clear();
+    }
+
     /// Best-effort clean shutdown; ignores errors (the process-group kill is the backstop).
     pub fn shutdown(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);

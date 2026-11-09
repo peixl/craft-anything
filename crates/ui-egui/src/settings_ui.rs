@@ -790,6 +790,13 @@ fn number<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range: std::ops::
     ui.add(egui::DragValue::new(value).range(range).prefix(prefix).suffix(suffix)).changed()
 }
 
+/// DragValue edits through f64 and settings persist as signed TOML integers. New values must
+/// round-trip through both; opening the page must not clamp an existing larger saved count.
+fn count_number(ui: &mut Ui, value: &mut usize) -> bool {
+    let max = usize::try_from((1u64 << 53) - 1).unwrap_or(usize::MAX);
+    ui.add(egui::DragValue::new(value).range(0..=max).clamp_existing_to_range(false)).changed()
+}
+
 fn builds(app: &mut CraftApp, ui: &mut Ui) {
     let mut changed = false;
     let b = &mut app.settings.build;
@@ -797,10 +804,19 @@ fn builds(app: &mut CraftApp, ui: &mut Ui) {
         changed |= number(ui, &mut b.good_enough, 50.0..=100.0, "", " %");
     });
     row(ui, "Refining rounds", "At most this many rounds of fixes after the first build.", |ui| {
-        changed |= number(ui, &mut b.max_rounds, 0..=20, "", "");
+        ui.add_enabled_ui(!b.unlimited_rounds, |ui| {
+            changed |= number(ui, &mut b.max_rounds, 0..=u32::MAX, "", "");
+        });
+        changed |= widgets::toggle(ui, &mut b.unlimited_rounds, "Unlimited").changed();
     });
     row(ui, "Website pages", "Other pages of a website studied and compared besides the one you gave.", |ui| {
-        changed |= number(ui, &mut b.max_pages, 0..=craft_anything_ai::rebuild::kinds::website::MAX_ROUTES, "", "");
+        ui.add_enabled_ui(!b.unlimited_pages, |ui| {
+            changed |= count_number(ui, &mut b.max_pages);
+        });
+        changed |= widgets::toggle(ui, &mut b.unlimited_pages, "Unlimited").changed();
+    });
+    row(ui, "Website depth", "Link levels to explore. Zero means no depth limit.", |ui| {
+        changed |= count_number(ui, &mut b.max_page_depth);
     });
     row(ui, "Match my pictures", "Apps and games: keep refining until they look this alike to your pictures. Off, the likeness is only reported.", |ui| {
         let mut on = b.picture_good_enough.is_some();

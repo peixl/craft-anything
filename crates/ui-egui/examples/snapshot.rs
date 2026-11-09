@@ -146,6 +146,16 @@ fn main() {
             a
         });
     }
+    if want("build-budgets") {
+        render(&out, "build-budgets", w, h, scale, || {
+            let mut a = demo::app(demo::engine(Mode::Beginner, true));
+            a.state.settings_open = true;
+            a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Builds;
+            a.settings.build.max_rounds = 30;
+            a.settings.build.max_pages = 40;
+            a
+        });
+    }
     if want("palette") {
         render(&out, "palette", w, h, scale, || {
             let mut a = demo::app(demo::engine(Mode::Experienced, true));
@@ -160,6 +170,18 @@ fn main() {
             demo::fill_projects(&mut a);
             a
         });
+    }
+    for deep in [false, true] {
+        let name = if deep { "make-app-deep" } else { "make-app-clean" };
+        if want(name) {
+            render(&out, name, w, h, scale, move || {
+                let mut a = demo::app(demo::engine(Mode::Beginner, true));
+                a.settings.deep_mode = deep;
+                a.engine.session().settings.deep_mode = deep;
+                a.state.make.target = craft_anything_engine::workspace::TargetRef::Local { path: PathBuf::from("/samples/calculator") };
+                a
+            });
+        }
     }
     if want("sidebar-folded") {
         render(&out, "sidebar-folded", w, h, scale, || {

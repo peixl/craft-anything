@@ -820,10 +820,6 @@ impl CraftApp {
             self.settings.deep_mode = on;
             self.settings_changed();
             self.log(false, if on { "Deep mode on" } else { "Clean room on" });
-            // Deep mode wants Ghidra: offer to get it now rather than quietly going without.
-            if on && self.ghidra_missing() && self.ghidra.job.is_none() {
-                self.state.modal = Some(state::Modal::Ghidra);
-            }
         }
     }
 

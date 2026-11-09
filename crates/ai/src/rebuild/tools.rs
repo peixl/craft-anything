@@ -156,6 +156,10 @@ pub struct StartParams {
     /// Refinement rounds after the first build (default 2).
     #[serde(default)]
     pub rounds: Option<u32>,
+    /// Ignore the refinement-round budget. When omitted, use the setting unless rounds is
+    /// explicit. Progress/failure guards and cancellation still apply.
+    #[serde(default)]
+    pub unlimited_rounds: Option<bool>,
     /// Pictures of the original (absolute paths): the look the person expects. They're copied
     /// into the project's reference/ folder for the builder.
     #[serde(default)]
@@ -352,12 +356,14 @@ fn rebuild_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
             .with_remediation("Add to it with rebuild_note, or stop it with rebuild_stop."));
     }
     let root = ws.root.clone();
+    let (max_rounds, unlimited_rounds) = ctx.session.settings.build.round_budget(p.rounds, p.unlimited_rounds, 2);
     let opts = RunOptions {
         backend: p.backend,
         shown: message.clone(),
         message,
         continuing: p.resume,
-        max_rounds: p.rounds.unwrap_or(2),
+        max_rounds,
+        unlimited_rounds,
         beginner: false,
         clean_room: Some(ctx.session.clean_room()),
         ..RunOptions::default()
@@ -485,6 +491,23 @@ fn rebuild_check(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_round_choices_keep_legacy_defaults_and_explicit_precedence() {
+        let settings = craft_anything_engine::settings::BuildSettings { unlimited_rounds: true, ..Default::default() };
+        for (extra, expected) in [
+            (json!({}), (2, true)),
+            (json!({"rounds": 0}), (0, false)),
+            (json!({"rounds": 3}), (3, false)),
+            (json!({"rounds": 3, "unlimited_rounds": true}), (3, true)),
+            (json!({"unlimited_rounds": false}), (2, false)),
+        ] {
+            let mut input = json!({"request": "Build notes"});
+            input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let params: StartParams = serde_json::from_value(input).unwrap();
+            assert_eq!(settings.round_budget(params.rounds, params.unlimited_rounds, 2), expected);
+        }
+    }
     use craft_anything_engine::{CallOptions, Caller, Consent, Engine};
 
     #[test]

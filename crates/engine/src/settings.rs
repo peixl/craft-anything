@@ -89,7 +89,7 @@ pub struct Settings {
     /// The config.toml format version ([`SETTINGS_VERSION`]). Missing means 0: written before versions.
     pub version: u32,
     pub mode: Mode,
-    /// Deep mode: tools may look inside the original (its code, files and page source), with our
+    /// Deep mode (on for a new installation): tools may look inside the original (its code, files and page source), with our
     /// own engines and with Ghidra when it's installed. Off is Clean room: nothing inside the
     /// original is read, only what can be seen from outside ([`crate::clean_room`]).
     pub deep_mode: bool,
@@ -142,10 +142,16 @@ pub struct BuildSettings {
     pub good_enough: f64,
     /// Refinement rounds after the first build in the app (the CLI's `--rounds` sets its own).
     pub max_rounds: u32,
+    /// Refine until the checks pass or the run is stopped. Progress and failure guards still apply.
+    pub unlimited_rounds: bool,
     /// Widths (CSS px) a website and its rebuild are compared at.
     pub web_widths: Vec<u32>,
-    /// Other pages of a website studied and checked besides the start page.
+    /// Successfully captured other pages besides the start page; failed attempts don't consume it.
     pub max_pages: usize,
+    /// Traverse without a page-count budget; bounded capture storage and cancellation still apply.
+    pub unlimited_pages: bool,
+    /// Link depth from the start page (1 = its links). Zero removes this traversal-depth budget.
+    pub max_page_depth: usize,
     /// When set, an app or game must look at least this alike (percent) to the person's pictures
     /// (or the original running) to be good enough; unset, that likeness is only reported.
     pub picture_good_enough: Option<f64>,
@@ -155,11 +161,28 @@ pub struct BuildSettings {
 
 impl Default for BuildSettings {
     fn default() -> Self {
-        BuildSettings { good_enough: 90.0, max_rounds: 6, web_widths: vec![1440, 768, 390], max_pages: 4, picture_good_enough: None, parallel: 2 }
+        BuildSettings {
+            good_enough: 90.0,
+            max_rounds: 6,
+            unlimited_rounds: false,
+            web_widths: vec![1440, 768, 390],
+            max_pages: 4,
+            unlimited_pages: false,
+            max_page_depth: 2,
+            picture_good_enough: None,
+            parallel: 2,
+        }
     }
 }
 
 impl BuildSettings {
+    /// Resolve one caller's overrides without changing its historical numeric default. An
+    /// explicit number (including zero) opts out of inherited unlimited rounds; an explicit
+    /// unlimited choice wins over either number.
+    pub fn round_budget(&self, rounds: Option<u32>, unlimited: Option<bool>, legacy_default: u32) -> (u32, bool) {
+        (rounds.unwrap_or(legacy_default), unlimited.unwrap_or(self.unlimited_rounds && rounds.is_none()))
+    }
+
     /// The widths to compare at: the configured ones a capture can take (320-3840 px, at most 4),
     /// else the defaults (desktop, tablet and phone).
     pub fn widths(&self) -> Vec<u32> {
@@ -197,7 +220,7 @@ impl Default for Settings {
         Settings {
             version: SETTINGS_VERSION,
             mode: Mode::Beginner,
-            deep_mode: false,
+            deep_mode: true,
             theme: "studio".into(),
             language: String::new(),
             first_run_done: false,
@@ -219,10 +242,10 @@ impl Default for Settings {
 }
 
 /// The current `config.toml` format version. Bumping it means appending a step to [`SETTINGS_STEPS`].
-pub const SETTINGS_VERSION: u32 = 3;
+pub const SETTINGS_VERSION: u32 = 5;
 
 /// The steps that bring an older `config.toml` forward; step `i` goes from version `i` to `i + 1`.
-const SETTINGS_STEPS: &[Step<toml::Table>] = &[settings_v0_to_v1, settings_v1_to_v2, settings_v2_to_v3];
+const SETTINGS_STEPS: &[Step<toml::Table>] = &[settings_v0_to_v1, settings_v1_to_v2, settings_v2_to_v3, settings_v3_to_v4, settings_v4_to_v5];
 const _: () = assert!(SETTINGS_STEPS.len() == SETTINGS_VERSION as usize, "one step per config.toml version");
 
 /// Version 0 (no `version` key) has the same shape as version 1; only the number is new.
@@ -252,6 +275,19 @@ fn settings_v2_to_v3(_: &mut toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+/// Version 4 starts new installations in Deep mode. An older file without a mode used Clean
+/// room, so make that choice explicit before applying the new defaults. Existing choices win.
+fn settings_v3_to_v4(table: &mut toml::Table) -> Result<(), String> {
+    table.entry("deep_mode").or_insert(toml::Value::Boolean(false));
+    Ok(())
+}
+
+/// Version 5 adds explicit unlimited workflow choices and link depth. Serde supplies false,
+/// false and two for old files; existing numeric zeros and explicit choices are not rewritten.
+fn settings_v4_to_v5(_: &mut toml::Table) -> Result<(), String> {
+    Ok(())
+}
+
 /// Read a `config.toml` of any version: older ones are brought forward step by step; a newer one is
 /// read as far as its keys are known and keeps its version, so [`Settings::save_to`] won't write it.
 pub fn read_settings(text: &str) -> Result<Settings, String> {
@@ -263,6 +299,9 @@ pub fn read_settings(text: &str) -> Result<Settings, String> {
     if found <= SETTINGS_VERSION {
         let reached = upgrade(&mut table, found, 0, SETTINGS_STEPS)?;
         table.insert("version".into(), toml::Value::Integer(reached.into()));
+    } else {
+        // The defaults of a future version are unknown; don't assume permission to read a target.
+        table.entry("deep_mode").or_insert(toml::Value::Boolean(false));
     }
     table.try_into::<Settings>().map_err(|e| e.to_string())
 }
@@ -323,8 +362,8 @@ impl Settings {
         config_dir().join("config.toml")
     }
 
-    /// Load settings; a missing file gives defaults, an older one is brought up to date, a corrupt
-    /// one is set aside and replaced with defaults (never a crash).
+    /// Load settings; a missing file gives fresh defaults, an older one is brought up to date.
+    /// An unreadable existing file recovers in Clean room so losing a setting cannot widen access.
     pub fn load_from(path: &Path) -> Settings {
         match std::fs::read_to_string(path) {
             Ok(text) => match read_settings(&text) {
@@ -345,14 +384,23 @@ impl Settings {
                             "{} is from a newer Craft Anything (version {version}) and unreadable here ({e}); using defaults without saving",
                             path.display()
                         );
-                        return Settings { version, ..Settings::default() };
+                        return Settings { version, deep_mode: false, ..Settings::default() };
                     }
                     log::warn!("{} is unreadable ({e}); using defaults and keeping a copy", path.display());
                     let _ = std::fs::rename(path, path.with_extension("toml.broken"));
-                    Settings::default()
+                    Settings { deep_mode: false, ..Settings::default() }
                 }
             },
-            Err(_) => Settings::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A previous read may have set a broken config aside without saving a replacement
+                // (for example a read-only CLI call). That is still recovery on the next start.
+                let recovering = path.with_extension("toml.broken").try_exists().unwrap_or(true);
+                Settings { deep_mode: !recovering, ..Settings::default() }
+            }
+            Err(e) => {
+                log::warn!("{} couldn't be read ({e}); recovering in Clean room", path.display());
+                Settings { deep_mode: false, ..Settings::default() }
+            }
         }
     }
 
@@ -469,6 +517,61 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fresh_settings_start_deep_and_legacy_modes_keep_their_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let fresh = Settings::load_from(&path);
+        assert!(fresh.deep_mode && fresh.auto_mode);
+        assert!(!path.exists(), "loading fresh defaults does not write settings");
+        fresh.save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path), fresh);
+
+        for version in 0..4 {
+            let prefix = if version == 0 { String::new() } else { format!("version = {version}\n") };
+            let legacy = read_settings(&prefix).unwrap();
+            assert!(!legacy.deep_mode, "version {version} omitted Deep and used Clean room");
+            assert_eq!(legacy.version, SETTINGS_VERSION);
+            for deep in [true, false] {
+                let old = read_settings(&format!("{prefix}deep_mode = {deep}\nauto_mode = false\nruntime_study = false\n")).unwrap();
+                assert_eq!(old.deep_mode, deep, "version {version}");
+                assert!(!old.auto_mode && !old.runtime_study, "other saved choices stay");
+                old.save_to(&path).unwrap();
+                assert_eq!(Settings::load_from(&path), old);
+            }
+        }
+        for on in [true, false] {
+            assert_eq!(read_settings(&format!("[engines.ghidra]\nenabled = {on}\n")).unwrap().deep_mode, on);
+        }
+        assert!(!read_settings("deep_mode = false\n[engines.ghidra]\nenabled = true\n").unwrap().deep_mode);
+        assert!(read_settings(&format!("version = {SETTINGS_VERSION}\n")).unwrap().deep_mode);
+        assert!(read_settings("version = 4\n").unwrap().deep_mode, "version 4 already started fresh configurations in Deep");
+        assert!(!read_settings("version = 999\n").unwrap().deep_mode, "future implicit defaults are unknown");
+    }
+
+    #[test]
+    fn an_unreadable_existing_config_does_not_enable_deep_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+        assert!(!Settings::load_from(&path).deep_mode);
+        assert!(path.is_dir(), "a read error must not replace the original");
+    }
+
+    #[test]
+    fn broken_config_recovery_stays_clean_across_read_only_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let broken = "deep_mode = [not valid toml";
+        std::fs::write(&path, broken).unwrap();
+        assert!(!Settings::load_from(&path).deep_mode);
+        assert!(!path.exists(), "the broken file was set aside");
+        assert!(!Settings::load_from(&path).deep_mode, "a second read must not mistake recovery for a new installation");
+        assert_eq!(std::fs::read_to_string(path.with_extension("toml.broken")).unwrap(), broken);
+        Settings::default().save_to(&path).unwrap();
+        assert!(Settings::load_from(&path).deep_mode, "an explicit saved mode wins over the recovery marker");
+    }
+
+    #[test]
     fn build_settings_have_safe_widths_and_old_configs_get_defaults() {
         let b = BuildSettings { web_widths: vec![10, 1280, 99_999, 375, 200], ..BuildSettings::default() };
         assert_eq!(b.widths(), [1280, 375], "widths a capture can't take are dropped");
@@ -481,6 +584,25 @@ auto_mode = true
         .unwrap();
         assert_eq!(old.build, BuildSettings::default());
         assert_eq!(old.build.picture_good_enough, None, "picture likeness is only reported unless set");
+    }
+
+    #[test]
+    fn workflow_budgets_preserve_old_zeros_and_resolve_explicit_choices() {
+        let old = read_settings("version = 4\ndeep_mode = false\n[build]\nmax_rounds = 0\nmax_pages = 0\n").unwrap();
+        assert!(!old.deep_mode && !old.build.unlimited_rounds && !old.build.unlimited_pages);
+        assert_eq!((old.build.max_rounds, old.build.max_pages, old.build.max_page_depth), (0, 0, 2));
+        let mut settings = old;
+        settings.build.unlimited_rounds = true;
+        settings.build.unlimited_pages = true;
+        settings.build.max_page_depth = 0;
+        let loaded = read_settings(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded, settings);
+        assert_eq!(loaded.build.round_budget(None, None, 2), (2, true));
+        assert_eq!(loaded.build.round_budget(Some(0), None, 2), (0, false));
+        assert_eq!(loaded.build.round_budget(Some(3), None, 2), (3, false));
+        assert_eq!(loaded.build.round_budget(Some(3), Some(true), 2), (3, true));
+        assert_eq!(loaded.build.round_budget(None, Some(false), 2), (2, false));
+        assert_eq!(BuildSettings::default().round_budget(None, None, 2), (2, false));
     }
 
     use super::*;
@@ -592,13 +714,13 @@ default = "Claude Code"
         let unreadable = "version = 9\nmode = { kind = \"pro\" }\n";
         std::fs::write(&path, unreadable).unwrap();
         let s = Settings::load_from(&path);
-        assert_eq!(s, Settings { version: 9, ..Settings::default() });
+        assert_eq!(s, Settings { version: 9, deep_mode: false, ..Settings::default() });
         assert!(s.save_to(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), unreadable);
         assert!(!path.with_extension("toml.broken").exists());
         // A version that isn't a number is a broken file: set aside, defaults used.
         std::fs::write(&path, "version = \"two\"\n").unwrap();
-        assert_eq!(Settings::load_from(&path), Settings::default());
+        assert_eq!(Settings::load_from(&path), Settings { deep_mode: false, ..Settings::default() });
         assert!(path.with_extension("toml.broken").exists());
         assert!(read_settings("version = -1").is_err());
     }
@@ -612,7 +734,7 @@ default = "Claude Code"
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
         std::fs::write(&path, "mode = [[[").unwrap();
-        assert_eq!(Settings::load_from(&path), Settings::default());
+        assert_eq!(Settings::load_from(&path), Settings { deep_mode: false, ..Settings::default() });
         assert!(path.with_extension("toml.broken").exists());
     }
 

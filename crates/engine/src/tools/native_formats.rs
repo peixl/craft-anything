@@ -77,7 +77,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "core_evidence_browse",
             "Page through evidence",
-            "View part of a stored (or inline) evidence record: the summary, one part, one row of a list, a page of a list's rows (optionally only the rows matching given field values, cut to chosen fields, with the field names listed), or a part of a function dossier (pseudocode, assembly, basic_blocks, callers, callees, flow_*…), with coverage and next_offset. Nothing is analysed again.",
+            "View part of a stored (or inline) evidence record: the summary, one part, one row, filtered/projected rows, a function dossier facet, or a nested value selected by JSON pointer (such as /items/0/pseudo_code). Pages include coverage and next_offset and fit a bounded JSON response. Nothing is analysed again.",
             "Read a big result a page at a time.",
             Core,
             e,
@@ -206,6 +206,18 @@ pub enum Show {
         name: String,
         #[serde(default)]
         offset: usize,
+        #[serde(default = "d_show_limit")]
+        limit: usize,
+    },
+    /// An exact JSON pointer relative to the record's result, such as /items/0/pseudo_code.
+    /// Empty selects the whole result; ~1 escapes / and ~0 escapes ~ in a field name.
+    Path {
+        path: String,
+        /// Rows for arrays, UTF-16 code units for text.
+        #[serde(default)]
+        offset: usize,
+        /// Most rows, or blocks of 64 UTF-16 code units for text. Serialized byte limits may
+        /// produce a shorter page; continue at coverage.next_offset.
         #[serde(default = "d_show_limit")]
         limit: usize,
     },
@@ -610,32 +622,89 @@ fn core_target_triage(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
 // Analysis view
 
 /// Find a value by key anywhere in the first levels of `v`.
-fn find_key<'a>(v: &'a Value, key: &str, depth: usize) -> Option<&'a Value> {
+fn find_key_at<'a>(v: &'a Value, key: &str, depth: usize) -> Option<(&'a Value, String)> {
     if depth > 4 {
         return None;
     }
     match v {
-        Value::Object(m) => m.get(key).or_else(|| m.values().find_map(|x| find_key(x, key, depth + 1))),
+        Value::Object(m) => m
+            .get(key)
+            .map(|v| (v, format!("/{}", pointer_token(key))))
+            .or_else(|| m.iter().find_map(|(name, x)| find_key_at(x, key, depth + 1).map(|(v, path)| (v, format!("/{}{path}", pointer_token(name)))))),
         _ => None,
     }
 }
 
+fn find_key<'a>(v: &'a Value, key: &str, depth: usize) -> Option<&'a Value> {
+    find_key_at(v, key, depth).map(|(v, _)| v)
+}
+
+fn pointer_token(s: &str) -> String {
+    s.replace('~', "~0").replace('/', "~1")
+}
+
+/// Leave room for the evidence envelope and the agent's summary around the page.
+const PAGE_BYTES: usize = 8 * 1024;
+
+/// Count serialized bytes without allocating a second copy of a potentially enormous value.
+fn json_size(value: &impl Serialize, budget: usize) -> Option<usize> {
+    struct Budget(usize);
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut remaining = Budget(budget);
+    serde_json::to_writer(&mut remaining, value).ok()?;
+    Some(budget - remaining.0)
+}
+
+fn page_too_large(value: &Value, path: &str) -> ToolError {
+    let mut children = Vec::new();
+    let mut remaining = 2048usize;
+    if let Some(fields) = value.as_object() {
+        for name in fields.keys().take(32) {
+            let child = format!("{path}/{}", pointer_token(name));
+            let Some(size) = json_size(&child, remaining) else { break };
+            remaining = remaining.saturating_sub(size + 1);
+            children.push(child);
+        }
+    }
+    ToolError::new(ErrorCode::OverLimit, "This value is too large for one evidence page.")
+        .with_remediation("Use core_evidence_browse with show.kind=path and a narrower JSON pointer from details, or use rows with fields to select smaller fields. No row was skipped.")
+        .with_details(json!({"path": path, "narrower_paths": children}))
+}
+
 /// Page text by UTF-16 code units without splitting a surrogate pair.
-fn page_text(s: &str, offset: usize, limit: usize) -> (String, usize, Option<usize>) {
+fn page_text(s: &str, offset: usize, limit: usize, byte_budget: usize) -> (String, usize, Option<usize>) {
     let total: usize = s.encode_utf16().count();
     let mut out = String::new();
     let mut pos = 0usize;
     let mut taken = 0usize;
     let mut next = None;
+    let mut bytes = 0usize;
     for c in s.chars() {
         let w = c.len_utf16();
         if pos >= offset {
-            if taken + w > limit {
+            let encoded = match c {
+                '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+                '\u{0000}'..='\u{001f}' => 6,
+                _ => c.len_utf8(),
+            };
+            if taken.saturating_add(w) > limit || bytes.saturating_add(encoded) > byte_budget {
                 next = Some(pos);
                 break;
             }
             out.push(c);
             taken += w;
+            bytes += encoded;
         } else if pos + w > offset {
             // offset lands inside a surrogate pair: start at the next character
         }
@@ -675,16 +744,33 @@ fn core_evidence_browse(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
             let row = row.ok_or_else(|| ToolError::invalid(format!("nothing in {list} matches {pick}")))?;
             (json!({"list": list, "pick": pick, "row": row}), Coverage::complete(1))
         }
-        Show::Rows { list, offset, limit, matching, fields, field_names } => page_of(r, list, *offset, *limit, matching, fields, *field_names)?,
-        Show::FunctionPart { name, offset, limit } => page_of(r, name, *offset, *limit, &BTreeMap::new(), &[], false)?,
+        Show::Rows { list, offset, limit, matching, fields, field_names } => page_of(named_value(r, list)?, *offset, *limit, matching, fields, *field_names)?,
+        Show::FunctionPart { name, offset, limit } => page_of(named_value(r, name)?, *offset, *limit, &BTreeMap::new(), &[], false)?,
+        Show::Path { path, offset, limit } => {
+            let mut chars = path.chars();
+            let mut valid = path.is_empty() || path.starts_with('/');
+            while let Some(c) = chars.next() {
+                if c == '~' && !matches!(chars.next(), Some('0' | '1')) {
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid {
+                return Err(ToolError::invalid(
+                    "path must be a JSON pointer: start with /, escape ~ as ~0 and / in field names as ~1, or use an empty path for the result.",
+                ));
+            }
+            let value = r.pointer(path).ok_or_else(|| ToolError::invalid("No value at this evidence result path.").with_details(json!({"path": path})))?;
+            page_of(SelectedValue { value, path: path.clone(), label: ("path", path) }, *offset, *limit, &BTreeMap::new(), &[], false)?
+        }
     };
     let status = match coverage.status {
         craft_anything_evidence::CoverageStatus::Complete
-            if matches!(p.show, Show::Rows { .. } | Show::FunctionPart { .. }) && coverage.examined == Some(0) =>
+            if matches!(p.show, Show::Rows { .. } | Show::FunctionPart { .. } | Show::Path { .. }) && coverage.examined == Some(0) =>
         {
             "empty"
         }
-        craft_anything_evidence::CoverageStatus::Complete if matches!(p.show, Show::Rows { .. } | Show::FunctionPart { .. }) => "page",
+        craft_anything_evidence::CoverageStatus::Complete if matches!(p.show, Show::Rows { .. } | Show::FunctionPart { .. } | Show::Path { .. }) => "page",
         craft_anything_evidence::CoverageStatus::Partial => "page",
         _ => "all-in-view",
     };
@@ -695,6 +781,7 @@ fn core_evidence_browse(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         .summary(format!("Part of {} evidence ({status}).", parent.operation))
         .confidence(parent.confidence)
         .authority(parent.authority)
+        .target_content(parent.carries_target_content)
         .coverage(coverage)
         .link(parent.id.clone())
         .build()?;
@@ -718,11 +805,21 @@ fn row_matches(row: &Value, matching: &BTreeMap<String, Value>) -> bool {
     })
 }
 
-/// A page of a list: its rows (only the matching ones, cut to `fields`) or text by
-/// UTF-16 units.
+struct SelectedValue<'a> {
+    value: &'a Value,
+    path: String,
+    label: (&'static str, &'a str),
+}
+
+fn named_value<'a>(r: &'a Value, name: &'a str) -> Result<SelectedValue<'a>, ToolError> {
+    let (value, path) =
+        find_key_at(r, name, 0).ok_or_else(|| ToolError::invalid(format!("no {name} in this record")).with_details(json!({"available": keys(r)})))?;
+    Ok(SelectedValue { value, path, label: ("list", name) })
+}
+
+/// A bounded JSON page: matching/projected rows, or text measured in UTF-16 units.
 fn page_of(
-    r: &Value,
-    list: &str,
+    selected: SelectedValue<'_>,
     offset: usize,
     limit: usize,
     matching: &BTreeMap<String, Value>,
@@ -730,48 +827,81 @@ fn page_of(
     field_names: bool,
 ) -> Result<(Value, Coverage), ToolError> {
     let limit = limit.clamp(1, 5000);
-    let v = find_key(r, list, 0).ok_or_else(|| ToolError::invalid(format!("no {list} in this record")).with_details(json!({"available": keys(r)})))?;
+    let SelectedValue { value: v, path, label: (label, name) } = selected;
     let narrowed = !matching.is_empty() || !fields.is_empty() || field_names;
     Ok(match v {
         Value::Array(a) => {
-            let rows: Vec<&Value> = a.iter().filter(|x| row_matches(x, matching)).collect();
-            let items: Vec<Value> = rows
-                .iter()
-                .skip(offset)
-                .take(limit)
-                .map(|x| match x {
-                    Value::Object(_) if !fields.is_empty() => {
-                        Value::Object(fields.iter().filter_map(|f| field(x, f).map(|v| (f.clone(), v.clone()))).collect())
-                    }
-                    x => (*x).clone(),
-                })
-                .collect();
-            let cov = Coverage::page(items.len() as u64, rows.len() as u64, offset as u64);
-            let mut out = json!({"list": list, "offset": offset, "items": items, "total": rows.len()});
+            let total = a.iter().filter(|x| row_matches(x, matching)).count();
+            let mut out = json!({label: name, "offset": offset, "items": [], "total": total});
             if !matching.is_empty() {
                 out["list_total"] = json!(a.len());
             }
             if field_names {
-                let names: BTreeSet<&String> = rows.iter().filter_map(|x| x.as_object()).flat_map(|m| m.keys()).take(100_000).collect();
+                let mut names = BTreeSet::new();
+                let mut remaining = PAGE_BYTES;
+                for name in a.iter().filter(|x| row_matches(x, matching)).filter_map(|x| x.as_object()).flat_map(|m| m.keys()).take(100_000) {
+                    if names.insert(name) {
+                        let size = json_size(name, remaining).ok_or_else(|| page_too_large(v, &path))?;
+                        remaining = remaining.saturating_sub(size + 1);
+                    }
+                }
                 out["field_names"] = json!(names);
             }
+            let mut remaining = PAGE_BYTES.saturating_sub(json_size(&out, PAGE_BYTES).ok_or_else(|| page_too_large(v, &path))?);
+            let mut items = Vec::new();
+            for (index, row) in a.iter().enumerate().filter(|(_, x)| row_matches(x, matching)).skip(offset).take(limit) {
+                let comma = usize::from(!items.is_empty());
+                let budget = remaining.saturating_sub(comma);
+                let projected: Option<BTreeMap<&str, &Value>> =
+                    (row.is_object() && !fields.is_empty()).then(|| fields.iter().filter_map(|f| field(row, f).map(|v| (f.as_str(), v))).collect());
+                let size = match &projected {
+                    Some(fields) => json_size(fields, budget),
+                    None => json_size(row, budget),
+                };
+                let Some(size) = size else {
+                    if items.is_empty() {
+                        return Err(page_too_large(row, &format!("{path}/{index}")));
+                    }
+                    break;
+                };
+                remaining = remaining.saturating_sub(size + comma);
+                items.push(match projected {
+                    Some(fields) => json!(fields),
+                    None => row.clone(),
+                });
+            }
+            let cov = Coverage::page(items.len() as u64, total as u64, offset as u64);
+            out["items"] = json!(items);
             (out, cov)
         }
         _ if narrowed => {
-            return Err(ToolError::invalid(format!("{list} isn't a list of records, so matching, fields and field_names don't apply"))
+            return Err(ToolError::invalid(format!("{name} isn't a list of records, so matching, fields and field_names don't apply"))
                 .with_remediation("Leave them out to page it as it is."));
         }
         Value::String(s) => {
-            let (text, total, next) = page_text(s, offset, limit.saturating_mul(64));
+            let total = s.encode_utf16().count();
+            let mut out = json!({label: name, "offset": offset, "text": "", "total_utf16_units": total});
+            let budget = PAGE_BYTES.saturating_sub(json_size(&out, PAGE_BYTES).ok_or_else(|| page_too_large(v, &path))?);
+            let (text, total, next) = page_text(s, offset, limit.saturating_mul(64), budget);
+            if text.is_empty() && next.is_some() {
+                return Err(page_too_large(v, &path));
+            }
             let cov = Coverage {
                 status: if next.is_some() { craft_anything_evidence::CoverageStatus::Partial } else { craft_anything_evidence::CoverageStatus::Complete },
                 examined: Some(text.encode_utf16().count() as u64),
                 total: Some(total as u64),
                 next_offset: next.map(|n| n as u64),
             };
-            (json!({"list": list, "offset": offset, "text": text, "total_utf16_units": total}), cov)
+            out["text"] = json!(text);
+            (out, cov)
         }
-        other => (json!({"list": list, "value": other}), Coverage::complete(1)),
+        other => {
+            let mut out = json!({label: name, "value": null});
+            let overhead = json_size(&out, PAGE_BYTES).ok_or_else(|| page_too_large(v, &path))?.saturating_sub(4);
+            json_size(other, PAGE_BYTES.saturating_sub(overhead)).ok_or_else(|| page_too_large(v, &path))?;
+            out["value"] = other.clone();
+            (out, Coverage::complete(1))
+        }
     })
 }
 
@@ -933,6 +1063,134 @@ mod tests {
             json!({"source": {"kind": "inline", "evidence": d}, "show": {"kind": "rows", "list": "pseudocode", "fields": ["x"]}}),
         );
         assert!(err.message.contains("isn't a list of records"), "{}", err.message);
+    }
+
+    fn recorded_result(result: serde_json::Value) -> (crate::Engine, craft_anything_evidence::Evidence) {
+        use craft_anything_evidence::{Authority, Confidence, Environment, EvidenceBuilder, Subject};
+        let engine = crate::Engine::new(crate::testing::session());
+        let evidence = EvidenceBuilder::new("native_functions_decompile", Subject { kind: "native".into(), ..Subject::default() }, Environment::builtin(false))
+            .result(result)
+            .confidence(Confidence::Derived)
+            .authority(Authority::OutsideService)
+            .target_content(true)
+            .build()
+            .unwrap();
+        engine.session().record(evidence.clone()).unwrap();
+        (engine, evidence)
+    }
+
+    #[test]
+    fn nested_text_pages_reach_the_tail_without_losing_unicode_or_provenance() {
+        let original = format!("{}TAIL_MARKER", "a\n\"\\\u{0000}😀".repeat(6000));
+        let (engine, evidence) = recorded_result(json!({"items": [{"pseudo_code": original}]}));
+        // Resolve by id from disk, not just from the in-memory ledger.
+        {
+            let mut session = engine.session();
+            session.ensure_shared_project().unwrap();
+            session.clear_ledger();
+        }
+        let mut offset = 0;
+        let mut text = String::new();
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages < 200, "pages must make forward progress");
+            let page = call(
+                &engine,
+                "core_evidence_browse",
+                json!({"source": {"kind": "saved", "evidence_id": evidence.id}, "show": {"kind": "path", "path": "/items/0/pseudo_code", "offset": offset, "limit": 5000}}),
+            );
+            let result = &page["result"];
+            assert!(result["shown"].to_string().len() <= super::PAGE_BYTES);
+            assert!(result.to_string().len() < 10 * 1024, "leave room for the agent's summary");
+            assert_eq!(result["shown"]["path"], "/items/0/pseudo_code");
+            assert_eq!(result["shown"]["total_utf16_units"], original.encode_utf16().count());
+            assert_eq!(page["carries_target_content"], true);
+            assert_eq!(page["confidence"], "derived");
+            assert_eq!(page["authority"], "outside-service");
+            assert_eq!(page["links"][0], evidence.id);
+            text.push_str(result["shown"]["text"].as_str().unwrap());
+            match result["coverage"]["next_offset"].as_u64() {
+                Some(next) => {
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert!(pages > 2);
+        assert_eq!(text, original);
+    }
+
+    #[test]
+    fn exact_paths_escape_names_and_keep_text_offset_semantics() {
+        let (engine, evidence) = recorded_result(json!({"a/b~c": "😀A🦀Z", "count": 7}));
+        let browse = |path: &str, offset: usize, limit: usize| {
+            call(
+                &engine,
+                "core_evidence_browse",
+                json!({"source": {"kind": "inline", "evidence": evidence}, "show": {"kind": "path", "path": path, "offset": offset, "limit": limit}}),
+            )
+        };
+        let page = browse("/a~1b~0c", 1, 0);
+        assert_eq!(page["result"]["shown"]["text"], "A🦀Z", "an offset inside a surrogate pair starts after it");
+        assert_eq!(page["result"]["coverage"]["at_end"], true);
+        let page = browse("/a~1b~0c", usize::MAX, 1);
+        assert_eq!(page["result"]["shown"]["text"], "");
+        assert_eq!(page["result"]["coverage"]["status"], "empty");
+        assert_eq!(browse("/count", 0, 1)["result"]["shown"]["value"], 7);
+        assert_eq!(browse("", 0, 1)["result"]["shown"]["value"], evidence.result);
+        for path in ["count", "/missing", "/a~2b", "/a~"] {
+            let error = call_err(
+                &engine,
+                "core_evidence_browse",
+                json!({"source": {"kind": "saved", "evidence_id": evidence.id}, "show": {"kind": "path", "path": path}}),
+            );
+            assert_eq!(error.code, craft_anything_evidence::ErrorCode::BadInput, "{path}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn row_pages_budget_json_without_skipping_oversized_items() {
+        let rows: Vec<_> = (0..23).map(|i| json!({"index": i, "text": "\n".repeat(700)})).collect();
+        let (engine, evidence) = recorded_result(json!({"items": rows}));
+        let mut read = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = call(
+                &engine,
+                "core_evidence_browse",
+                json!({"source": {"kind": "saved", "evidence_id": evidence.id}, "show": {"kind": "path", "path": "/items", "offset": offset}}),
+            );
+            assert!(page["result"]["shown"].to_string().len() <= super::PAGE_BYTES);
+            let items = page["result"]["shown"]["items"].as_array().unwrap();
+            read.extend(items.iter().cloned());
+            match page["coverage"]["next_offset"].as_u64() {
+                Some(next) => {
+                    assert_eq!(next, offset + items.len() as u64);
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(read, rows);
+
+        let (engine, evidence) = recorded_result(json!({"nested": {"items": [{"small": 1}, {"pseudo_code": "x".repeat(20_000)}, {"small": 3}]}}));
+        let source = json!({"kind": "saved", "evidence_id": evidence.id});
+        let page = call(&engine, "core_evidence_browse", json!({"source": source, "show": {"kind": "rows", "list": "items"}}));
+        assert_eq!(page["result"]["shown"]["items"], json!([{"small": 1}]));
+        assert_eq!(page["coverage"]["next_offset"], 1);
+        let error = call_err(&engine, "core_evidence_browse", json!({"source": source, "show": {"kind": "rows", "list": "items", "offset": 1}}));
+        assert_eq!(error.code, craft_anything_evidence::ErrorCode::OverLimit);
+        let details = error.details.unwrap();
+        assert_eq!(details["path"], "/nested/items/1");
+        assert!(details["narrower_paths"].as_array().unwrap().contains(&json!("/nested/items/1/pseudo_code")));
+        let page =
+            call(&engine, "core_evidence_browse", json!({"source": source, "show": {"kind": "path", "path": "/nested/items/1/pseudo_code", "offset": 19_998}}));
+        assert_eq!(page["result"]["shown"]["text"], "xx");
+        let page = call(&engine, "core_evidence_browse", json!({"source": source, "show": {"kind": "rows", "list": "items", "offset": 2}}));
+        assert_eq!(page["result"]["shown"]["items"], json!([{"small": 3}]));
     }
 
     #[test]

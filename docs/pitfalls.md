@@ -87,6 +87,17 @@ names (`git merge-base --is-ancestor <fix> <release tag>`), and check the messag
 
 ## Tests
 
+**A display selector was treated as evidence content.** Native evidence deliberately removes `document`
+from its canonical parameters, so hashing that selector into completion checks rejected a valid result.
+Keep call/document attribution separate from canonical analysis parameters. A completion without an
+evidence id cannot borrow an older matching record; test two targets with the same function name.
+
+**A stronger fresh default leaked into recovery.** Moving an unreadable config to `.broken` and
+returning conservative settings only protected the first load: the next read saw no config and
+used the new default. Treat the backup as a recovery marker until settings are explicitly saved.
+Test repeated read-only starts as well as migration, and make mode-specific fixtures choose their
+mode explicitly instead of depending on the current fresh-install default.
+
 **A heartbeat sampled before shutdown raced a successful stop.** A child could write between
 the baseline read and `stop()`, failing the descendant cleanup test even when cleanup worked.
 Probe for exit instead of timing writes: the child holds a file lock the system releases only

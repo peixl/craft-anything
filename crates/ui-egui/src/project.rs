@@ -83,12 +83,7 @@ impl CraftApp {
             return;
         }
         let target = resolve_target(&draft);
-        // Deep mode reads a program's code with Ghidra: got first when it isn't here (asked once).
-        if matches!(target, TargetRef::Local { .. }) && !draft.skip_ghidra && self.ghidra_missing() {
-            self.ghidra.start_after = Some(Box::new(draft));
-            self.state.modal = Some(Modal::Ghidra);
-            return;
-        }
+        // Ghidra augments the built-in analysis; its optional setup must not block starting.
         if self.creating.is_some() {
             return;
         }
@@ -153,6 +148,7 @@ impl CraftApp {
             beginner: self.beginner(),
             kinds: self.kinds.clone(),
             max_rounds: build.max_rounds,
+            unlimited_rounds: build.unlimited_rounds,
             good_enough: build.good_enough,
             clean_room: Some(!self.settings.deep_mode),
             ..RunOptions::default()
@@ -2190,6 +2186,19 @@ impl CraftApp {
 mod tests {
     use super::*;
     use craft_anything_ai::AgentEvent;
+
+    #[test]
+    fn gui_runs_keep_the_selected_refinement_budget() {
+        let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+        app.settings.build.max_rounds = 0;
+        let finite = app.run_options(None, None, None, Vec::new());
+        assert_eq!(finite.max_rounds, 0);
+        assert!(!finite.unlimited_rounds);
+        app.settings.build.unlimited_rounds = true;
+        let unlimited = app.run_options(None, None, None, Vec::new());
+        assert!(unlimited.unlimited_rounds);
+        assert_eq!(unlimited.max_rounds, 0, "the saved numeric choice is retained for when unlimited is turned off");
+    }
 
     #[test]
     fn the_app_starts_with_the_persons_settings_while_the_engine_is_busy() {

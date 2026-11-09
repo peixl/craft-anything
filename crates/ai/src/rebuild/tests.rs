@@ -451,7 +451,7 @@ fn notes_added_while_it_works_reach_the_agent_at_its_next_step() {
         notes: notes.clone(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
@@ -1098,8 +1098,14 @@ fn games_get_the_mechanics_sheet_and_decompile_only_in_deep_mode() {
     for b in [&deep, &clean] {
         assert!(b.contains("MECHANICS.md"), "{b}");
     }
-    // Deep mode: 1:1 with the original's own files, for private use, never decrypting anything.
-    assert!(deep.contains("original game's own files") && deep.contains("Never decrypt") && deep.contains("must not be shared") && deep.contains("CREDITS.md"));
+    // Deep mode uses the actual archive capabilities, reporting missing keys or engines.
+    assert!(
+        deep.contains("original game's own files")
+            && deep.contains("Encryption needs the correct key")
+            && deep.contains("must not be shared")
+            && deep.contains("CREDITS.md")
+    );
+    assert!(deep.contains("missing key or format support") && deep.contains("preserve the originals") && !deep.contains("Never decrypt"));
     assert!(deep.contains(PRIVATE_USE_NOTE), "the README line the credits check looks for, as written");
     // It points the builder at the app's own archive tools before any outside converter.
     assert!(deep.contains("enable_toolset with \"formats\"") && deep.contains("game_pak_extract") && deep.contains("game_unreal_texture_export"));
@@ -1357,7 +1363,7 @@ fn an_api_backend_builds_with_the_build_tools() {
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
@@ -1474,7 +1480,7 @@ fn the_mechanics_sheet_is_required_and_held_against_the_code() {
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
@@ -2571,7 +2577,7 @@ fn check_worker(ws: &Workspace, deep: bool) -> Worker {
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
@@ -2923,8 +2929,15 @@ fn a_stopped_build_is_told_to_carry_on_not_start_over() {
 fn the_extractor_takes_the_originals_out_and_the_builder_is_told_where() {
     let b = extract_brief(Path::new("D:/Games/Cave Game"));
     assert!(b.contains("D:/Games/Cave Game") && b.contains("app/Original/") && b.contains("permission: true"), "{b}");
-    assert!(b.contains("Never decrypt") && b.contains("You don't build the game") && b.contains(&format!("app/{ORIGINALS_MANIFEST}")), "{b}");
-    assert!(b.contains("never write your own archive reader") && b.contains("ending in `/`"), "{b}");
+    assert!(
+        b.contains("Encryption needs the correct key") && b.contains("You don't build the game") && b.contains(&format!("app/{ORIGINALS_MANIFEST}")),
+        "{b}"
+    );
+    assert!(
+        b.contains("format-specific helper inside app/Original/tools/") && b.contains("preserve the original archives") && b.contains("ending in `/`"),
+        "{b}"
+    );
+    assert!(!b.contains("Never decrypt") && !b.contains("never write your own archive reader"), "{b}");
     assert!(ORIGINALS_READY.contains("app/Original/MANIFEST.md") && ORIGINALS_READY.contains("CREDITS.md"));
 }
 
@@ -3043,7 +3056,7 @@ fn preparing_the_builders_agent_does_not_lock_up() {
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
@@ -3085,7 +3098,7 @@ fn the_run_answers_the_builders_own_check_during_its_turn() {
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: Some((Arc::new(SheetKind), 90.0)),
         reset_progress_after_notes: false,
@@ -3282,7 +3295,7 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
         ])),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
@@ -3586,7 +3599,7 @@ fn a_session_left_on_another_computer_starts_a_new_one_from_the_project() {
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
@@ -3641,7 +3654,7 @@ fn a_missing_session_with_nothing_to_start_from_is_said_plainly() {
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
@@ -3707,7 +3720,7 @@ fn the_builders_conversation_travels_with_the_project() {
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
@@ -3784,7 +3797,7 @@ fn a_build_says_when_it_waits_for_an_analysis_started_earlier() {
         notes: Arc::default(),
         feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
         assets: false,
-        decompiled: false,
+        decompiled: DecompileProof::default(),
         usage: None,
         self_check: None,
         reset_progress_after_notes: false,
@@ -3807,4 +3820,174 @@ fn a_build_says_when_it_waits_for_an_analysis_started_earlier() {
         })
         .collect();
     assert!(said.iter().any(|t| t.contains("waiting for Ghidra's analysis of this program, started earlier")), "{said:?}");
+}
+
+#[test]
+fn decompile_coverage_requires_a_current_successful_call_for_this_target() {
+    use craft_anything_evidence::{Environment, EvidenceBuilder, Subject};
+    let (bytes, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sample.elf");
+    std::fs::write(&path, bytes).unwrap();
+    let engine = Engine::new(craft_anything_engine::testing::session());
+    engine.call("core_target_open", json!({"path": path}), CallOptions::new(Caller::Cli)).unwrap();
+    let sha = engine.session().active().unwrap().target.sha256.clone();
+    let result = engine.call("native_functions_decompile", json!({"addresses": ["main"]}), CallOptions::new(Caller::Cli)).unwrap().to_json();
+    let batch_id = result["id"].as_str().unwrap().to_string();
+    let single = engine.call("native_function_pseudocode", json!({"function": "main"}), CallOptions::new(Caller::Cli)).unwrap().to_json();
+    let single_id = single["id"].as_str().unwrap().to_string();
+    let started = |tool: &str, input: Value| AgentEvent::ToolStarted { call_id: "current-call".into(), tool: tool.into(), input };
+    let finished = |tool: &str, ok: bool, id: Option<&str>| AgentEvent::ToolFinished {
+        call_id: "current-call".into(),
+        tool: tool.into(),
+        ok,
+        summary: String::new(),
+        evidence_id: id.map(str::to_string),
+    };
+    let batch = "native_functions_decompile";
+    let mut proof = DecompileProof { target_sha: Some(sha.clone()), ..Default::default() };
+    proof.observe(&finished(batch, true, Some(&batch_id)), &engine);
+    assert!(!proof.complete, "an old/unpaired result is not evidence of a call in this run");
+    proof.observe(&started(batch, json!({"addresses": ["main"]})), &engine);
+    assert!(!proof.complete, "starting is not succeeding");
+    proof.observe(&finished(batch, false, Some(&batch_id)), &engine);
+    assert!(!proof.complete, "failed calls do not count");
+    proof.observe(&started(batch, json!({"addresses": ["helper"]})), &engine);
+    proof.observe(&finished(batch, true, Some(&batch_id)), &engine);
+    assert!(!proof.complete, "another selector's old record does not answer this call");
+    for (subject, code) in [("another-target", "int main() { return 1; }"), (sha.as_str(), "  ")] {
+        let record = EvidenceBuilder::new(batch, Subject { kind: "native".into(), sha256: Some(subject.into()), name: None }, Environment::builtin(false))
+            .params(json!({"addresses": ["main"], "document": null}))
+            .result(json!({"items": [{"ok": true, "pseudo_code": code}]}))
+            .build()
+            .unwrap();
+        let id = record.id.clone();
+        engine.session().record(record).unwrap();
+        proof.observe(&started(batch, json!({"addresses": ["main"]})), &engine);
+        proof.observe(&finished(batch, true, Some(&id)), &engine);
+        assert!(!proof.complete, "wrong target or empty code cannot satisfy the reminder");
+    }
+    proof.observe(&started(batch, json!({"addresses": ["main"]})), &engine);
+    proof.observe(&finished(batch, true, Some(&batch_id)), &engine);
+    assert!(proof.complete, "a current successful cached batch is valid despite its content id already existing");
+    let mut next_run = DecompileProof { target_sha: Some(sha.clone()), ..Default::default() };
+    next_run.observe(&finished(batch, true, Some(&batch_id)), &engine);
+    assert!(!next_run.complete, "completion from an earlier run doesn't carry over");
+    next_run.observe(&started("native_function_pseudocode", json!({"function": "main"})), &engine);
+    next_run.observe(&finished("native_function_pseudocode", true, Some(&single_id)), &engine);
+    assert!(next_run.complete, "single-function success also counts");
+    let mut no_id = DecompileProof { target_sha: Some(sha), ..Default::default() };
+    no_id.observe(&started(batch, json!({"addresses": ["main"]})), &engine);
+    no_id.observe(&finished(batch, true, None), &engine);
+    assert!(!no_id.complete, "without an attributable result id, an old matching record cannot prove what just ran");
+}
+
+#[test]
+fn unattributed_batches_cannot_reuse_old_success_or_another_documents_same_name() {
+    use craft_anything_evidence::{Environment, EvidenceBuilder};
+    let (bytes, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.elf");
+    let second = dir.path().join("second.elf");
+    std::fs::write(&first, &bytes).unwrap();
+    let mut different = bytes;
+    different.push(0);
+    std::fs::write(&second, different).unwrap();
+    let engine = Engine::new(craft_anything_engine::testing::session());
+    engine.call("core_target_open", json!({"path": first}), CallOptions::new(Caller::Cli)).unwrap();
+    let subject = engine.session().active().unwrap().target.subject();
+    let old = engine.call("native_functions_decompile", json!({"addresses": ["main"]}), CallOptions::new(Caller::Cli)).unwrap().to_json();
+    let failed = EvidenceBuilder::new("native_functions_decompile", subject.clone(), Environment::builtin(false))
+        .params(json!({"addresses": ["main"], "document": null}))
+        .result(json!({"items": [{"ok": false, "error": "fixture failure"}], "succeeded": 0, "failed": 1}))
+        .build()
+        .unwrap();
+    let failed_id = failed.id.clone();
+    engine.session().record(failed).unwrap();
+    let started = |input: Value| AgentEvent::ToolStarted { call_id: "current".into(), tool: "native_functions_decompile".into(), input };
+    let finished = |id: Option<&str>| AgentEvent::ToolFinished {
+        call_id: "current".into(),
+        tool: "native_functions_decompile".into(),
+        ok: true,
+        summary: String::new(),
+        evidence_id: id.map(str::to_string),
+    };
+    let mut proof = DecompileProof { target_sha: subject.sha256, ..Default::default() };
+    for id in [None, Some(failed_id.as_str())] {
+        proof.observe(&started(json!({"addresses": ["main"]})), &engine);
+        proof.observe(&finished(id), &engine);
+        assert!(!proof.complete, "an all-failed current batch cannot borrow the older main result");
+    }
+    engine.call("core_target_open", json!({"path": second}), CallOptions::new(Caller::Cli)).unwrap();
+    let (document, second_sha) = {
+        let session = engine.session();
+        let target = &session.active().unwrap().target;
+        (target.id.clone(), target.sha256.clone())
+    };
+    let input = json!({"addresses": ["main"], "document": document});
+    let other = engine.call("native_functions_decompile", input.clone(), CallOptions::new(Caller::Cli)).unwrap().to_json();
+    for id in [None, other["id"].as_str(), old["id"].as_str()] {
+        proof.observe(&started(input.clone()), &engine);
+        proof.observe(&finished(id), &engine);
+        assert!(!proof.complete, "a same-name call on another document cannot satisfy this target");
+    }
+    let mut second_proof = DecompileProof { target_sha: Some(second_sha), ..Default::default() };
+    second_proof.observe(&started(input), &engine);
+    second_proof.observe(&finished(other["id"].as_str()), &engine);
+    assert!(second_proof.complete, "the attributed result remains valid for its own target");
+}
+
+#[test]
+fn check_history_admission_preserves_the_last_checkpoint_and_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(dir.path(), "History", "Build notes", TargetRef::None).unwrap();
+    std::fs::create_dir_all(ws.app_dir()).unwrap();
+    let work = ws.app_dir().join("notes.txt");
+    std::fs::write(&work, "keep my work").unwrap();
+    let old = CheckResult::new("build", 1, true, "previous result");
+    ws.manifest.checks.push(old.clone());
+    ws.manifest.awaiting_check = true;
+    ws.save().unwrap();
+    let before = std::fs::read(ws.root.join("craft.json")).unwrap();
+    let progress = BuildProgress { unchanged_turns: 1, ..Default::default() };
+    progress.save(&ws.root).unwrap();
+    let pending = CheckResult::new("build", 2, true, "new result");
+    for limits in [CheckHistoryLimits { records: 1, serialized_bytes: 4096 }, CheckHistoryLimits { records: 3, serialized_bytes: 8 }] {
+        let error = append_checks(&mut ws, std::slice::from_ref(&pending), limits).unwrap_err();
+        assert_eq!(error.code, ErrorCode::OverLimit);
+        assert_eq!(error.details.as_ref().unwrap()["reason"], "check_history_limit");
+        assert_eq!(ws.manifest.checks, std::slice::from_ref(&old));
+        assert!(ws.manifest.awaiting_check);
+        assert_eq!(std::fs::read(ws.root.join("craft.json")).unwrap(), before);
+        assert_eq!(BuildProgress::load(&ws.root).unwrap(), progress);
+        assert_eq!(std::fs::read_to_string(&work).unwrap(), "keep my work");
+    }
+    // Count actual escaped pretty JSON, including the checks field's indentation, not string
+    // character counts. Small injected bounds exercise both sides without a large allocation.
+    let escaped = CheckResult::new("build", 2, true, "\u{0000}\n\"".repeat(32));
+    let exact = serde_json::to_vec_pretty(&json!({"checks": [&old, &escaped]})).unwrap().len();
+    assert!(append_checks(&mut ws, std::slice::from_ref(&escaped), CheckHistoryLimits { records: 2, serialized_bytes: exact - 1 }).is_err());
+    append_checks(&mut ws, std::slice::from_ref(&escaped), CheckHistoryLimits { records: 2, serialized_bytes: exact }).unwrap();
+    assert_eq!(ws.manifest.checks, [old, escaped]);
+}
+
+#[test]
+fn native_decompile_reminder_does_not_apply_to_non_native_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("app.js");
+    std::fs::write(&script, "export const answer = 42;").unwrap();
+    let engine = Engine::new(craft_anything_engine::testing::session());
+    assert!(native_decompile_target(&engine, &script).is_none());
+    assert!(native_decompile_target(&engine, dir.path()).is_none());
+    let (bytes, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
+    let program = dir.path().join("sample.elf");
+    std::fs::write(&program, bytes).unwrap();
+    assert!(native_decompile_target(&engine, &program).is_some());
+    engine.call("core_target_open", json!({"path": program}), CallOptions::new(Caller::Cli)).unwrap();
+    engine.call("native_function_pseudocode", json!({"function": "main"}), CallOptions::new(Caller::Cli)).unwrap();
+    let opened_sha = engine.session().active().unwrap().target.sha256.clone();
+    std::fs::write(&program, "now a script, but the open target is unchanged").unwrap();
+    assert_eq!(native_decompile_target(&engine, &program), Some(opened_sha));
+    let fresh = Engine::new(craft_anything_engine::testing::session());
+    assert!(native_decompile_target(&fresh, &program).is_none());
 }

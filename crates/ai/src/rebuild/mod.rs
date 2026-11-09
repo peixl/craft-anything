@@ -31,7 +31,7 @@ pub use craft_anything_platform::serve::StaticServer;
 use craft_anything_platform::serve::serve_dir;
 use craft_anything_platform::sync::Mutex;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -137,6 +137,8 @@ pub struct RunOptions {
     pub continuing: bool,
     /// Refinement rounds after the first build (each fixes what the last check found).
     pub max_rounds: u32,
+    /// Ignore the refinement count, while keeping cancellation and progress/failure guards.
+    pub unlimited_rounds: bool,
     /// Stop refining once the build looks at least this alike (percent).
     pub good_enough: f64,
     pub beginner: bool,
@@ -161,6 +163,7 @@ impl Default for RunOptions {
             shown_pictures: Vec::new(),
             continuing: false,
             max_rounds: 6,
+            unlimited_rounds: false,
             good_enough: 90.0,
             beginner: true,
             kinds: KindRegistry::built_in(),
@@ -294,7 +297,7 @@ impl RebuildRun {
             notes: notes.clone(),
             feed: feed.clone(),
             assets: false,
-            decompiled: false,
+            decompiled: DecompileProof::default(),
             usage: Some(UsageClock { root: root.clone(), since: Instant::now() }),
             self_check: None,
             reset_progress_after_notes: false,
@@ -496,14 +499,187 @@ struct Worker {
     /// An asset provider's key is set up, so the builder can generate pictures and 3D models if the
     /// project allows it.
     assets: bool,
-    /// The builder has decompiled something this run (Deep mode requires it).
-    decompiled: bool,
+    /// Successful, target-scoped decompilation observed in this run's tool calls.
+    decompiled: DecompileProof,
     /// Where this run adds its working time, tokens and cost (`None` in tests that don't build).
     usage: Option<UsageClock>,
     /// The kind and bar the builder's own checks (`rebuild_check`) are judged by, once known.
     self_check: Option<(Arc<dyn kinds::TargetKind>, f64)>,
     /// A hook consumed a new request; persist its reset only after the builder finishes.
     reset_progress_after_notes: bool,
+}
+
+#[derive(Default)]
+struct DecompileProof {
+    target_sha: Option<String>,
+    pending: HashMap<String, DecompileCall>,
+    complete: bool,
+}
+
+struct DecompileCall {
+    operation: &'static str,
+    selector: Option<String>,
+    document: Option<String>,
+}
+
+fn decompile_selector(operation: &str, input: &Value) -> Option<String> {
+    let key = if operation == "native_functions_decompile" { "addresses" } else { "function" };
+    // Native evidence intentionally omits the document selector from its content identity.
+    // Attribute an explicit document separately instead of expecting it in evidence.params.
+    input.get(key).and_then(|v| serde_json::to_vec(v).ok()).map(|v| craft_anything_evidence::sha256_hex(&v))
+}
+
+fn native_decompile_target(engine: &Engine, program: &Path) -> Option<String> {
+    use craft_anything_engine::tools::native_common::{NativeImage, NativeState};
+    // The open target owns its content identity. Reuse its parsed image or shared bytes rather
+    // than rereading a potentially multi-gigabyte file that may since have changed on disk.
+    let cached = {
+        let session = engine.session();
+        let target = session.targets().find(|t| t.target.path == program);
+        if let Some(target) = target {
+            let supported =
+                target.ext.get::<NativeState>().map(|s| s.img.mode.is_some()).or_else(|| target.ext.get::<NativeImage>().map(|i| i.0.mode.is_some()));
+            if let Some(supported) = supported {
+                return supported.then(|| target.target.sha256.clone());
+            }
+            Some(target.target.clone())
+        } else {
+            None
+        }
+    };
+    let target = cached.or_else(|| craft_anything_engine::target::Target::load(program).ok())?;
+    let image = craft_anything_engine::tools::native_common::image_for(&target).ok()?;
+    image.mode.is_some().then_some(target.sha256)
+}
+
+impl DecompileProof {
+    fn observe(&mut self, event: &AgentEvent, engine: &Engine) {
+        if self.complete || self.target_sha.is_none() {
+            return;
+        }
+        let operation =
+            |tool: &str| engine.registry().canonical(tool).filter(|name| matches!(*name, "native_function_pseudocode" | "native_functions_decompile"));
+        match event {
+            AgentEvent::ToolStarted { call_id, tool, input } => {
+                if let Some(operation) = operation(tool)
+                    && self.pending.len() < 64
+                {
+                    self.pending.insert(
+                        call_id.clone(),
+                        DecompileCall {
+                            operation,
+                            selector: decompile_selector(operation, input),
+                            document: input.get("document").and_then(Value::as_str).map(String::from),
+                        },
+                    );
+                }
+            }
+            AgentEvent::ToolFinished { call_id, tool, ok, evidence_id, .. } => {
+                let Some(DecompileCall { operation: started, selector, document }) = self.pending.remove(call_id) else { return };
+                if !ok || operation(tool) != Some(started) {
+                    return;
+                }
+                let accepts = |e: &craft_anything_evidence::Evidence| {
+                    e.operation == started
+                        && e.subject.sha256 == self.target_sha
+                        && selector.as_ref().is_none_or(|wanted| decompile_selector(started, &e.params).as_ref() == Some(wanted))
+                        && if started == "native_functions_decompile" {
+                            e.result.get("items").and_then(Value::as_array).is_some_and(|items| {
+                                items.iter().any(|item| {
+                                    item.get("ok").and_then(Value::as_bool) == Some(true)
+                                        && item.get("pseudo_code").and_then(Value::as_str).is_some_and(|code| !code.trim().is_empty())
+                                })
+                            })
+                        } else {
+                            e.result.get("pseudo_code").and_then(Value::as_str).is_some_and(|code| !code.trim().is_empty())
+                        }
+                };
+                let session = engine.session();
+                if let Some(document) = document {
+                    let selected = session.targets().find(|target| target.target.id == document || target.target.name == document);
+                    if selected.map(|target| &target.target.sha256) != self.target_sha.as_ref() {
+                        return;
+                    }
+                }
+                self.complete = match evidence_id {
+                    Some(id) => session.resolve_evidence(id).is_ok_and(|e| accepts(&e)),
+                    // A successful envelope can contain an all-failed batch. Without its id,
+                    // an older same-selector result in the ledger cannot prove what just ran.
+                    None => false,
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The manifest retains check history in memory and serializes it on every save. Unlimited
+/// refinement removes a workflow count, not these retention bounds; existing history is never
+/// pruned implicitly when the next check no longer fits.
+#[derive(Clone, Copy)]
+struct CheckHistoryLimits {
+    records: usize,
+    serialized_bytes: usize,
+}
+
+impl Default for CheckHistoryLimits {
+    fn default() -> Self {
+        Self { records: 65_536, serialized_bytes: 16 * 1024 * 1024 }
+    }
+}
+
+fn append_checks(ws: &mut Workspace, added: &[CheckResult], limits: CheckHistoryLimits) -> Result<(), ToolError> {
+    let refused = |boundary| {
+        ToolError::new(
+            ErrorCode::OverLimit,
+            format!("The next check exceeds the retained check-history {boundary} bound ({} records, {} serialized bytes). The previous history and build files are intact.", limits.records, limits.serialized_bytes),
+        )
+        .with_remediation("Start a new project from the existing app folder to continue with a fresh history. No saved checks were deleted.")
+        .with_details(json!({"reason": "check_history_limit", "boundary": boundary, "max_records": limits.records, "max_serialized_bytes": limits.serialized_bytes}))
+    };
+    if ws.manifest.checks.len().checked_add(added.len()).is_none_or(|n| n > limits.records) {
+        return Err(refused("records"));
+    }
+    struct JoinedChecks<'a>(&'a [CheckResult], &'a [CheckResult]);
+    impl serde::Serialize for JoinedChecks<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq;
+            let mut sequence = serializer.serialize_seq(None)?;
+            for check in self.0.iter().chain(self.1) {
+                sequence.serialize_element(check)?;
+            }
+            sequence.end()
+        }
+    }
+    #[derive(serde::Serialize)]
+    struct History<'a> {
+        checks: JoinedChecks<'a>,
+    }
+    struct Budget {
+        remaining: usize,
+        exceeded: bool,
+    }
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.remaining {
+                self.exceeded = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            }
+            self.remaining -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut budget = Budget { remaining: limits.serialized_bytes, exceeded: false };
+    // A named field preserves the same pretty-JSON indentation as checks inside craft.json.
+    // Serialize into a counting writer, so admission never allocates a duplicate history.
+    if let Err(error) = serde_json::to_writer_pretty(&mut budget, &History { checks: JoinedChecks(&ws.manifest.checks, added) }) {
+        return Err(if budget.exceeded { refused("serialized_bytes") } else { ToolError::internal(format!("Couldn't serialize check history: {error}")) });
+    }
+    ws.manifest.checks.extend_from_slice(added);
+    Ok(())
 }
 
 /// The project a run records its usage in, and when it last did.
@@ -884,9 +1060,14 @@ impl Worker {
         } else if ws.manifest.not_working_checks >= NOT_WORKING_CHECK_LIMIT {
             return Err(not_working(ws));
         }
-        let mut refinements = 0;
+        let mut refinements = 0u64;
         // Deep mode on a program: decompiling is required, so a build turn without any gets one reminder.
-        let must_decompile = deep && matches!(ws.manifest.target, TargetRef::Local { .. });
+        self.decompiled = DecompileProof::default();
+        if deep && let TargetRef::Local { path } = &ws.manifest.target {
+            let (program, _) = locate(path, kind.studies_folder());
+            self.decompiled.target_sha = native_decompile_target(&self.engine, &program);
+        }
+        let must_decompile = self.decompiled.target_sha.is_some();
         let mut reminded = false;
         // The builder finished and only the check didn't: the build is there to check.
         let mut only_check = carrying_on && !first && opts.message.is_none() && ws.manifest.awaiting_check;
@@ -969,17 +1150,18 @@ impl Worker {
                     prompt = p;
                     continue;
                 }
-                if must_decompile && !self.decompiled && !reminded {
+                if must_decompile && !self.decompiled.complete && !reminded {
                     reminded = true;
                     prompt = DECOMPILE_FIRST.to_string();
                     continue;
                 }
             }
-            round += 1;
+            round =
+                round.checked_add(1).ok_or_else(|| ToolError::new(ErrorCode::OverLimit, "The saved build round counter cannot represent another round."))?;
             let checking = if ws.manifest.target == TargetRef::None { "Checking the build…" } else { "Checking the build against the original…" };
             self.step(ws, Step::Check, Status::Checking, checking)?;
             let checks = self.checks_with_a_retry(ws, kind, round)?;
-            ws.manifest.checks.extend(checks.iter().cloned());
+            append_checks(ws, &checks, CheckHistoryLimits::default())?;
             ws.manifest.awaiting_check = false;
             // A round in which every check works (built and served) ends the streak; any other
             // round adds to it, across runs, until the limit stops the build.
@@ -1012,10 +1194,11 @@ impl Worker {
             if ws.manifest.not_working_checks >= NOT_WORKING_CHECK_LIMIT {
                 return Err(not_working(ws));
             }
-            if refinements >= opts.max_rounds {
+            if !opts.unlimited_rounds && refinements >= u64::from(opts.max_rounds) {
                 break;
             }
-            refinements += 1;
+            refinements =
+                refinements.checked_add(1).ok_or_else(|| ToolError::new(ErrorCode::OverLimit, "The refinement counter cannot represent another round."))?;
             // Nothing written yet: a fix for a build that doesn't exist sends the builder looking for one.
             // It is asked to write the project and to show its build output (#736).
             let refined = if app_is_empty(ws) { NO_PROJECT_PROMPT.to_string() } else { kind.refine(check, sees_pictures) };
@@ -1253,6 +1436,7 @@ impl Worker {
     }
 
     fn converse_turn(&mut self, ws: &mut Workspace, agent: &mut dyn Conversation, text: &str, retry: bool) -> Result<String, ToolError> {
+        self.decompiled.pending.clear();
         if retry {
             agent.retry(text);
         } else {
@@ -1282,15 +1466,10 @@ impl Worker {
                         let build = self.engine.registry().get(tool).is_some_and(|s| s.toolset == craft_anything_engine::Toolset::Build);
                         agent.answer_consent(call_id, build);
                     }
-                    // Decided on the tool's own id (its CLI and `mcp__…__` names included).
-                    AgentEvent::ToolStarted { tool, .. }
-                        if self.engine.registry().canonical(tool) == Some(craft_anything_engine::tools::native_function::PSEUDOCODE_TOOL) =>
-                    {
-                        self.decompiled = true
-                    }
                     AgentEvent::Error { message, remediation, .. } => failed = Some((message.clone(), remediation.clone())),
                     _ => {}
                 }
+                self.decompiled.observe(&e, &self.engine);
                 if let AgentEvent::TurnDone { input_tokens, output_tokens, cost_usd, cost_is_estimate, .. } = &e {
                     self.record_usage(Some((*input_tokens, *output_tokens, *cost_usd, *cost_is_estimate)));
                 }

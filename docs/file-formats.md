@@ -9,7 +9,9 @@ version up to the current one, then turn the document into Rust types. The step 
 |---|---|---|---|---|
 | `<project>/craft.json` | `engine::workspace` (`Manifest`) | `MANIFEST_VERSION` = 4 (`version`; missing = 0; 3 adds `approvals`, 4 adds the saved builder session's mode `agent_session_deep`; a version-3 session migrates as Deep) | brought forward, saved as current | opened read-only: saving is refused |
 | `<project>/inbox/build-progress.json` | `engine::workspace::progress` (`BuildProgress`; written only by the rebuild run) | `BUILD_PROGRESS_VERSION` = 1 (`version`; missing = 0) | brought forward; an absent file starts with no counted turns | the build stops and the record is left unchanged |
-| `config.toml` (`settings::config_dir()`) | `engine::settings` (`Settings`) | `SETTINGS_VERSION` = 2 (`version`; missing = 0; 2 moved `[engines.ghidra] enabled` to `deep_mode`) | brought forward | loaded, never saved over |
+| `config.toml` (`settings::config_dir()`) | `engine::settings` (`Settings`) | `SETTINGS_VERSION` = 5 (`version`; missing = 0; 2 moved `[engines.ghidra] enabled` to `deep_mode`; 3 added project folders; 4 preserves older implicit Clean room while fresh installations default to Deep; 5 adds explicit workflow budgets) | brought forward without changing saved modes or numeric zero meanings | loaded, never saved over |
+| `<project>/capture/routes-coverage.json` | `engine::workspace::route_coverage` | 1 | versioned parsing; existing `routes.json` keeps its array shape | unsupported versions are not treated as current coverage |
+| `<export>/craft-pseudocode-export.json` | `engine::tools::program_facts_tools` | 2 | version 1 migrates with builtin policy; existing files and unknown legacy provenance are preserved | refused without changing the export |
 | `<name>.cany/project.toml` | `engine::project` (`ProjectMeta`) | `FORMAT_VERSION` = 1 (`format_version`, required) | brought forward | refused, with "update Craft Anything" |
 | `<project>/transcript.json` | `ai::context` (the API builder's conversation) | `TRANSCRIPT_VERSION` = 2 (`{version, deep, history}`; a version-1 transcript counts as Deep) | read as before; one without `deep` is resumed only in Deep | not resumed; a fresh build replaces it |
 | `<project>/app/mechanics.json` | `engine::mechanics` (written by the builder, read by `MechanicsCheck`) | `MECHANICS_VERSION` = 1 (`version`; missing = 1) | — | the check fails and says so |
@@ -42,12 +44,14 @@ A file from a newer Craft Anything is never downgraded or overwritten, because t
 know would be lost. `craft.json` and `config.toml` are still read as far as their fields are known,
 so the person can see their project or keep their settings; every save returns a `ToolError` that
 says to update Craft Anything. A newer `craft.json` whose fields can't be read at all is refused the
-same way, and a newer `config.toml` that can't be read gives defaults without touching the file.
+same way, and a newer `config.toml` that can't be read recovers in Clean room without touching the file.
 A newer `.cany` is refused outright: its evidence layout may have changed in ways we can't
 see.
 
 A file that can't be parsed is not "newer": `config.toml` is set aside as `config.toml.broken` and
-defaults are used; an unreadable `craft.json` gives a plain-English error when opened and is left
+Clean room recovery settings are used, including later starts while only the `.broken` backup exists.
+A missing configuration without that recovery backup starts with fresh Deep defaults.
+An unreadable `craft.json` gives a plain-English error when opened and is left
 out of the project list.
 
 ## Adding a migration step

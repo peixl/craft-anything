@@ -246,6 +246,39 @@ fn cancel_stops_a_request_quickly() {
 }
 
 #[test]
+fn controlled_decompilation_stops_while_waiting_for_a_silent_bridge() {
+    let fake = Fake::start(Mode::Silent, "tok");
+    let mut client = Client::connect(fake.addr, "tok", Instant::now() + Duration::from_secs(5)).unwrap();
+    let started = Instant::now();
+    let result = decompile_request(&mut client, 0x401000, &|| started.elapsed() >= Duration::from_millis(150), started + Duration::from_secs(30));
+    assert!(matches!(result, Err(GhidraError::Cancelled)));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    client.abort();
+    drop(client);
+    fake.join();
+}
+
+#[test]
+fn controlled_decompilation_can_stop_while_another_request_holds_the_client() {
+    let fake = Fake::start(Mode::Silent, "tok");
+    let client = Arc::new(Mutex::new(Client::connect(fake.addr, "tok", Instant::now() + Duration::from_secs(5)).unwrap()));
+    let held = client.lock().unwrap();
+    held.label("test bridge request");
+    let other = client.clone();
+    let (finished, result) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let result = client_for_request(&other, &|| true).map(|_| ());
+        finished.send(result).unwrap();
+    });
+    let result = result.recv_timeout(Duration::from_secs(3));
+    drop(held);
+    waiter.join().unwrap();
+    assert!(matches!(result.unwrap(), Err(GhidraError::Cancelled)));
+    drop(client);
+    fake.join();
+}
+
+#[test]
 fn an_oversized_reply_is_refused_and_the_connection_closed() {
     let fake = Fake::start(Mode::Huge, "tok");
     let deadline = Instant::now() + Duration::from_secs(5);

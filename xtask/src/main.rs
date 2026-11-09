@@ -355,6 +355,8 @@ fn schemas(root: &Path, check: bool) -> bool {
     let files = [
         ("craft.schema.json", craft_anything_engine::workspace::manifest_schema()),
         ("build-progress.schema.json", craft_anything_engine::workspace::progress::build_progress_schema()),
+        ("routes-coverage.schema.json", craft_anything_engine::workspace::route_coverage::route_coverage_schema()),
+        ("source-export.schema.json", craft_anything_engine::tools::program_facts_tools::source_export_schema()),
         ("mechanics.schema.json", craft_anything_engine::mechanics::mechanics_schema()),
         ("self-test.schema.json", craft_anything_engine::self_test::self_test_schema()),
     ];

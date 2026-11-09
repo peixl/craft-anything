@@ -900,3 +900,6 @@ In this project, {kind}: {choice}.	このプロジェクトでは {kind}: {choic
 Couldn't change the approvals:	承認を変更できませんでした:
 What the builder may do without asking you, in this project.	このプロジェクトでビルダーが確認なしにしてよいこと。
 Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	既定は自動モードに従います。オンのときは元に戻せることは実行し、それ以外は拒否します。オフのときはビルダーが確認します。
+Unlimited	無制限
+Website depth	サイトの探索深度
+Link levels to explore. Zero means no depth limit.	探索するリンクの階層数です。0 は深度の制限なしを意味します。

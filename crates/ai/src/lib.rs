@@ -851,7 +851,7 @@ impl AiHub {
             model,
             local,
             effort: e.options.effort,
-            max_turns: e.options.max_turns.unwrap_or(agent::DEFAULT_MAX_TURNS),
+            max_turns: e.options.model_turn_limit(false),
             context_tokens: e.options.context_tokens.unwrap_or(0),
         })
     }
@@ -916,7 +916,7 @@ impl AiHub {
         lean_for_local: bool,
     ) -> Result<ApiConversation, ToolError> {
         let mut slot = self.build_model(entry)?;
-        slot.max_turns = slot.max_turns.max(agent::BUILDER_MAX_TURNS);
+        slot.max_turns = entry.options.model_turn_limit(true);
         let host = Arc::new(EngineHost(self.engine.clone()));
         ApiConversation::start_with(
             host,

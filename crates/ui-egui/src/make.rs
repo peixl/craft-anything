@@ -155,6 +155,7 @@ pub fn hero(app: &mut CraftApp, ui: &mut Ui, w: f32) {
         // Where it's saved: secondary to Start, so under it.
         ui.add_space(10.0);
         crate::folders::make_line(app, ui);
+        deep_engine_options(app, ui);
     });
 }
 
@@ -422,6 +423,11 @@ fn look_inside(app: &mut CraftApp, ui: &mut Ui) {
     if let Some(on) = pick {
         app.set_deep(on);
     }
+}
+
+/// Optional engine setup comes after Start so a fresh Deep installation keeps its main action in view.
+fn deep_engine_options(app: &mut CraftApp, ui: &mut Ui) {
+    let t = Tokens::get(ui.ctx());
     // Ghidra reads programs, not websites.
     if !matches!(app.state.make.target, TargetRef::Local { .. }) {
         return;

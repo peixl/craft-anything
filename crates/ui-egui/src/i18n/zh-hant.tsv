@@ -1462,3 +1462,6 @@ In this project, {kind}: {choice}.	在這個專案中，{kind}：{choice}。
 Couldn't change the approvals:	無法變更審核：
 What the builder may do without asking you, in this project.	在這個專案中，建置助手不必問你就可以做的事。
 Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	預設跟隨自動模式：開啟時，可復原的操作會執行，其餘會被拒絕；關閉時，建置助手會詢問。
+Unlimited	不限
+Website depth	網站探索深度
+Link levels to explore. Zero means no depth limit.	要探索的連結層數。0 表示不限深度。

@@ -76,6 +76,15 @@ pub trait DeepDecompiler: Send + Sync {
     /// Decompile the function at `entry` (an address in the engine's own space). `Ok(None)` means
     /// the engine has no better answer.
     fn decompile(&self, entry: u64) -> Result<Option<DeepFunction>, GhidraError>;
+    /// Decompile with the caller's stop signal. Existing providers keep working; providers that
+    /// can wait on another process should override this and check `cancel` while waiting.
+    fn decompile_controlled(&self, entry: u64, cancel: &dyn Fn() -> bool) -> Result<Option<DeepFunction>, GhidraError> {
+        if cancel() {
+            return Err(GhidraError::Cancelled);
+        }
+        let result = self.decompile(entry);
+        if cancel() { Err(GhidraError::Cancelled) } else { result }
+    }
     /// List the functions the engine found.
     fn list_functions(&self) -> Result<Vec<DeepFunction>, GhidraError>;
 }
@@ -861,14 +870,21 @@ impl DeepDecompiler for Session {
     }
 
     fn decompile(&self, entry: u64) -> Result<Option<DeepFunction>, GhidraError> {
-        let never_cancel = || false;
-        let v = self.lock().request(
-            "native_function_pseudocode",
-            serde_json::json!({"address": format!("{entry:#x}")}),
-            &never_cancel,
-            Self::request_deadline(),
-        )?;
-        Ok(decompiled(entry, &v))
+        self.decompile_controlled(entry, &|| false)
+    }
+
+    fn decompile_controlled(&self, entry: u64, cancel: &dyn Fn() -> bool) -> Result<Option<DeepFunction>, GhidraError> {
+        let mut client = client_for_request(&self.client, cancel)?;
+        client.label("Ghidra decompilation");
+        let result = decompile_request(&mut client, entry, cancel, Self::request_deadline());
+        if matches!(result, Err(GhidraError::Cancelled)) {
+            // The Java bridge handles one request at a time. Closing only the reader would
+            // leave its decompiler busy, so stop this owned process and reopen the saved
+            // analysis on the next call. Neither the target nor its saved analysis is changed.
+            client.abort();
+            self._process.lock().unwrap_or_else(PoisonError::into_inner).kill();
+        }
+        result
     }
 
     fn list_functions(&self) -> Result<Vec<DeepFunction>, GhidraError> {
@@ -887,6 +903,21 @@ impl DeepDecompiler for Session {
         }
         Ok(out)
     }
+}
+
+fn client_for_request<'a>(client: &'a Mutex<Client>, cancel: &dyn Fn() -> bool) -> Result<craft_anything_platform::sync::MutexGuard<'a, Client>, GhidraError> {
+    client.lock_unless(cancel).map(|guard| guard.unwrap_or_else(PoisonError::into_inner)).map_err(|why| match why {
+        craft_anything_platform::sync::GaveUp::Stopped => GhidraError::Cancelled,
+        craft_anything_platform::sync::GaveUp::Stuck(message) => GhidraError::Timeout(message),
+    })
+}
+
+fn decompile_request(client: &mut Client, entry: u64, cancel: &dyn Fn() -> bool, deadline: Instant) -> Result<Option<DeepFunction>, GhidraError> {
+    if cancel() {
+        return Err(GhidraError::Cancelled);
+    }
+    let value = client.request("native_function_pseudocode", serde_json::json!({"address": format!("{entry:#x}")}), cancel, deadline)?;
+    Ok(decompiled(entry, &value))
 }
 
 /// The bridge's `native_function_pseudocode` reply as a function (`null` means no answer).
