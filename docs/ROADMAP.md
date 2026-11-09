@@ -1019,6 +1019,10 @@ Owner: maintainers · Status: in progress
 ### R2.9 Everyday use: typing, projects, settings
 Owner: maintainers · Status: in progress
 Gaps found while using the app for real projects.
+- [ ] Start fresh installations in Deep mode while preserving saved choices; remove needless AI
+      tool-discovery barriers, make long evidence readable in pages, and use the available Deep
+      decompiler for batches. Align investigation prompts and contributor workflow with this behaviour.
+      — claimed: Codex, branch feature/r2.9-deep-investigation
 - [x] Each project chooses, per kind of action, what the builder's approvals get (allow, ask or
       refuse): reading the web, commands, files outside the project, pushing and publishing,
       deleting outside the project, system changes, other tools. Unset kinds follow Auto mode as
